@@ -79,6 +79,13 @@ export async function callAgent(payload: {
   const openclawToken = readEnv("OPENCLAW_TOKEN");
 
   if (openclawUrl) {
+    console.log("[insight] calling openclaw", {
+      app: payload.app,
+      goal: payload.goal,
+      focusArea: payload.focusArea ?? null,
+      evidenceCount: payload.evidence.length,
+      marketIncluded: Boolean(payload.market),
+    });
     try {
       const response = await fetch(openclawUrl, {
         method: "POST",
@@ -94,14 +101,28 @@ export async function callAgent(payload: {
       const body = await response.json();
       const normalized = normalizeInsightResponse(body);
       if (normalized) {
+        console.log("[insight] openclaw response accepted", {
+          app: payload.app,
+          insightCount: normalized.insights.length,
+        });
         return normalized;
       }
-    } catch {
-      // Fall through to direct LLM / fallback.
+      console.warn("[insight] openclaw response could not be normalized", {
+        app: payload.app,
+      });
+    } catch (error) {
+      console.warn("[insight] openclaw call failed, falling back to direct llm", {
+        app: payload.app,
+        reason: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
   try {
+    console.log("[insight] calling direct llm fallback", {
+      app: payload.app,
+      evidenceCount: payload.evidence.length,
+    });
     const result = await callJsonCompletion([
       {
         role: "system",
@@ -116,11 +137,24 @@ export async function callAgent(payload: {
 
     const normalized = normalizeInsightResponse(result);
     if (normalized) {
+      console.log("[insight] direct llm response accepted", {
+        app: payload.app,
+        insightCount: normalized.insights.length,
+      });
       return normalized;
     }
-  } catch {
-    // Use deterministic fallback.
+    console.warn("[insight] direct llm response could not be normalized", {
+      app: payload.app,
+    });
+  } catch (error) {
+    console.warn("[insight] direct llm call failed, using deterministic fallback", {
+      app: payload.app,
+      reason: error instanceof Error ? error.message : String(error),
+    });
   }
 
+  console.log("[insight] using deterministic fallback", {
+    app: payload.app,
+  });
   return fallbackInsights(payload.metrics);
 }

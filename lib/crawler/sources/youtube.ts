@@ -43,7 +43,8 @@ export async function fetchYouTube(app: { name: string }, cutoffUnix: number): P
 
     const searchResponse = await fetch(search);
     if (!searchResponse.ok) {
-      throw new Error(`YouTube search failed with status ${searchResponse.status}`);
+      const errorText = await searchResponse.text();
+      throw new Error(`YouTube search failed with status ${searchResponse.status}: ${errorText.slice(0, 300)}`);
     }
 
     const searchBody: any = await searchResponse.json();

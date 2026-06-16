@@ -24,6 +24,13 @@ router.post("/api/analyze", async (req, res) => {
 
     const dateStamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
     const reportId = `${String(apps[0]).toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${dateStamp}-${makeId(...apps, Date.now()).slice(0, 6)}`;
+    console.log("[analyze] request accepted", {
+      reportId,
+      apps,
+      goal: crawlReq.goal,
+      focusArea: crawlReq.focus_area ?? null,
+      cutoffDays: crawlReq.cutoffDays,
+    });
     await createReport({
       id: reportId,
       apps,
@@ -35,7 +42,7 @@ router.post("/api/analyze", async (req, res) => {
     });
 
     void runReport(reportId, apps, crawlReq.goal, crawlReq.focus_area, crawlReq.cutoffDays).catch((error) => {
-      console.error(`[report:${reportId}]`, error);
+      console.error(`[report:${reportId}] background run failed`, error);
     });
 
     const report = await getReport(reportId);

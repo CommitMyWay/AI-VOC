@@ -34,6 +34,13 @@ export async function fetchAllSources(appName: string, cutoffDays: number): Prom
   const cutoffUnix = cutoffFromDays(cutoffDays);
   const resolved = await resolveApp(appName);
   const target = { name: resolved.name, playId: resolved.playId, appStoreId: resolved.appStoreId };
+  console.log("[crawl] sources starting", {
+    appName,
+    resolvedName: resolved.name,
+    playId: resolved.playId,
+    appStoreId: resolved.appStoreId,
+    cutoffDays,
+  });
 
   const tasks: Array<{ source: ReviewSource; job: Promise<RawReview[]> }> = [
     { source: "google_play", job: withTimeout(fetchGooglePlay(target, cutoffUnix), "google_play") },
@@ -52,20 +59,39 @@ export async function fetchAllSources(appName: string, cutoffDays: number): Prom
   settled.forEach((result, index) => {
     const source = tasks[index].source;
     if (result.status === "fulfilled") {
+      console.log("[crawl] source finished", {
+        appName: resolved.name,
+        source,
+        reviewCount: result.value.length,
+      });
       if (result.value.length > 0) {
         sourcesUsed.push(source);
         reviews.push(...result.value);
       }
     } else {
+      const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+      console.warn("[crawl] source failed", {
+        appName: resolved.name,
+        source,
+        reason,
+      });
       failed.push({
         source,
-        reason: result.reason instanceof Error ? result.reason.message : String(result.reason),
+        reason,
       });
     }
   });
 
+  const deduped = dedupeReviews(reviews);
+  console.log("[crawl] sources completed", {
+    appName: resolved.name,
+    totalRawReviews: reviews.length,
+    dedupedReviews: deduped.length,
+    sourcesUsed,
+    failedCount: failed.length,
+  });
   return {
-    reviews: dedupeReviews(reviews),
+    reviews: deduped,
     sourcesUsed,
     failed,
   };

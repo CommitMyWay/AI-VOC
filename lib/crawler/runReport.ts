@@ -80,20 +80,39 @@ export async function runReport(reportId: string, apps: string[], goal: string, 
   let market: MarketView | null = null;
 
   try {
+    console.log(`[report:${reportId}] run started`, {
+      apps,
+      goal,
+      focusArea: focusArea ?? null,
+      cutoffDays,
+    });
     await clearReferencesForReport(reportId);
 
     for (const app of apps) {
+      console.log(`[report:${reportId}] crawl started`, {
+        app,
+      });
       pipelineEvents.emitEvent(reportId, "fetch", {
         app,
         message: `Crawling ${app} across app stores, communities, and social sources`,
       });
 
       const fetched = await fetchAllSources(app, cutoffDays);
+      console.log(`[report:${reportId}] crawl finished`, {
+        app,
+        fetchedReviews: fetched.reviews.length,
+        sourcesUsed: fetched.sourcesUsed,
+        failedSources: fetched.failed,
+      });
       const scopedReviews = fetched.reviews.map((review) => ({
         ...review,
         id: `${reportId}:${review.id}`,
       }));
       await persistReviews(reportId, scopedReviews);
+      console.log(`[report:${reportId}] reviews persisted`, {
+        app,
+        reviewCount: scopedReviews.length,
+      });
 
       pipelineEvents.emitEvent(reportId, "fetch", {
         app,
@@ -109,6 +128,10 @@ export async function runReport(reportId: string, apps: string[], goal: string, 
       });
       const classifications = await classifyReviews(scopedReviews, 20);
       await persistClassifications(classifications);
+      console.log(`[report:${reportId}] classifications persisted`, {
+        app,
+        classificationCount: classifications.length,
+      });
 
       pipelineEvents.emitEvent(reportId, "aggregate", {
         app,
@@ -116,6 +139,12 @@ export async function runReport(reportId: string, apps: string[], goal: string, 
       });
       const metrics = await buildMetrics(reportId, app);
       const evidence = await fetchEvidence(reportId, app);
+      console.log(`[report:${reportId}] metrics ready`, {
+        app,
+        reviewCount: metrics.reviewCount,
+        evidenceCount: evidence.length,
+        avgRating: metrics.rating,
+      });
 
       pipelineEvents.emitEvent(reportId, "insight", {
         app,
@@ -135,12 +164,23 @@ export async function runReport(reportId: string, apps: string[], goal: string, 
         insights: insight.insights,
         actions: insight.actions,
       };
+      console.log(`[report:${reportId}] insight ready`, {
+        app,
+        insightCount: insight.insights.length,
+        poActions: insight.actions.PO.length,
+        qaActions: insight.actions.QA.length,
+        marketingActions: insight.actions.Marketing.length,
+      });
 
       market = await buildMarketView(reportId);
       await updateReportData({
         id: reportId,
         status: "running",
         company_data: { data, market },
+      });
+      console.log(`[report:${reportId}] report snapshot updated`, {
+        app,
+        marketTotalReviews: market?.totalReviews ?? 0,
       });
     }
 
@@ -158,6 +198,11 @@ export async function runReport(reportId: string, apps: string[], goal: string, 
       completed_at: nowUnix(),
       company_data: finalPayload,
     });
+    console.log(`[report:${reportId}] run completed`, {
+      apps,
+      totalApps: finalMarket.totalApps,
+      totalReviews: finalMarket.totalReviews,
+    });
 
     pipelineEvents.emitEvent(reportId, "done", {
       reportId,
@@ -166,6 +211,7 @@ export async function runReport(reportId: string, apps: string[], goal: string, 
 
     return finalPayload;
   } catch (error) {
+    console.error(`[report:${reportId}] run failed`, error);
     await updateReport({
       id: reportId,
       status: "error",

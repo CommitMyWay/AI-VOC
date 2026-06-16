@@ -62,14 +62,27 @@ export async function classifyReviews(reviews: RawReview[], batchSize = 20): Pro
   try {
     getLlmConfig();
   } catch {
+    console.warn("[classify] llm config missing, using heuristic fallback", {
+      reviewCount: reviews.length,
+    });
     return fallbackClassify(reviews);
   }
 
   const client = createOpenAIClient();
   const output: Classification[] = [];
+  console.log("[classify] starting classification", {
+    reviewCount: reviews.length,
+    batchSize,
+    model: CLASSIFY_MODEL,
+  });
 
   for (let index = 0; index < reviews.length; index += batchSize) {
     const batch = reviews.slice(index, index + batchSize);
+    console.log("[classify] processing batch", {
+      batchStart: index,
+      batchEnd: index + batch.length - 1,
+      batchSize: batch.length,
+    });
 
     try {
       const completion = await client.chat.completions.create({
@@ -97,6 +110,10 @@ export async function classifyReviews(reviews: RawReview[], batchSize = 20): Pro
 
       const parsed = JSON.parse(completion.choices[0]?.message?.content || "{\"items\":[]}");
       const items = Array.isArray(parsed?.items) ? parsed.items : [];
+      console.log("[classify] batch completed", {
+        batchStart: index,
+        classifiedItems: items.length,
+      });
 
       for (const review of batch) {
         const match = items.find((item: any) => item?.reviewId === review.id);
@@ -115,10 +132,19 @@ export async function classifyReviews(reviews: RawReview[], batchSize = 20): Pro
           modelUsed: CLASSIFY_MODEL,
         });
       }
-    } catch {
+    } catch (error) {
+      console.warn("[classify] batch failed, using heuristic fallback", {
+        batchStart: index,
+        batchSize: batch.length,
+        reason: error instanceof Error ? error.message : String(error),
+      });
       output.push(...fallbackClassify(batch));
     }
   }
 
+  console.log("[classify] classification finished", {
+    reviewCount: reviews.length,
+    outputCount: output.length,
+  });
   return output;
 }

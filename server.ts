@@ -137,6 +137,14 @@ function dedupeStrings(values: unknown[]) {
   return out;
 }
 
+function sanitizeSubjectName(value: string) {
+  return value
+    .replace(/^(analyse|analyze|benchmark|compare|review|scan|research)\s+/i, "")
+    .replace(/\s+(for|vs)\s+.*$/i, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
 function normalizeQuestionKey(value: unknown) {
   if (typeof value !== "string") {
     return "unknown";
@@ -306,15 +314,18 @@ function extractFallbackIntent(raw: any, query: string, answers: Record<string, 
     ...(Array.isArray(answers?.competitors) ? answers.competitors : []),
   ]);
 
-  const explicitSubject = typeof answers?.subject === "string" && answers.subject.trim() ? answers.subject.trim() : null;
+  const explicitSubject = typeof answers?.subject === "string" && answers.subject.trim() ? sanitizeSubjectName(answers.subject.trim()) : null;
   const payloadSubject =
-    (typeof payload?.subject === "string" && payload.subject.trim()) ||
-    (typeof context?.target_product === "string" && context.target_product.trim()) ||
-    (typeof payload?.target_product === "string" && payload.target_product.trim()) ||
-    query;
+    (typeof payload?.subject === "string" && sanitizeSubjectName(payload.subject.trim())) ||
+    (typeof context?.target_product === "string" && sanitizeSubjectName(context.target_product.trim())) ||
+    (typeof payload?.target_product === "string" && sanitizeSubjectName(payload.target_product.trim())) ||
+    sanitizeSubjectName(query);
+
+  const explicitDataSources = dedupeStrings(Array.isArray(answers?.data_sources) ? answers.data_sources : []);
+  const mergedSources = explicitDataSources.length > 0 ? explicitDataSources : dedupeStrings(["google_play", "app_store", ...inferredSources]);
 
   return {
-    subject: explicitSubject || payloadSubject || query,
+    subject: explicitSubject || payloadSubject || sanitizeSubjectName(query),
     market:
       (typeof answers?.market === "string" && answers.market.trim()) ||
       (typeof context?.industry === "string" && context.industry.trim()) ||
@@ -334,7 +345,7 @@ function extractFallbackIntent(raw: any, query: string, answers: Record<string, 
       (Array.isArray(payload?.key_investigation_areas)
         ? dedupeStrings(payload.key_investigation_areas.map((item: any) => item?.product_domain).filter(Boolean)).slice(0, 3).join(", ")
         : ""),
-    data_sources: inferredSources.length > 0 ? inferredSources : ["app_store", "google_play"],
+    data_sources: mergedSources.length > 0 ? mergedSources : ["app_store", "google_play"],
     filters: {
       time_range: typeof answers?.time_range === "string" && answers.time_range.trim() ? answers.time_range : "last_90_days",
       sentiment: typeof answers?.sentiment === "string" && answers.sentiment.trim() ? answers.sentiment : "all",
@@ -355,7 +366,7 @@ function buildFallbackClarifyEnvelope(query: string, raw: any) {
           type: "text",
           question: "Which app or company should we analyze first?",
           choices: [],
-          recommended: intent.subject || query,
+          recommended: intent.subject || sanitizeSubjectName(query),
           allow_other: true,
         },
         {
