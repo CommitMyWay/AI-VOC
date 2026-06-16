@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { 
+import {
   Search, 
   Sparkles, 
   Trash2, 
@@ -28,7 +28,7 @@ import {
   ArrowLeft,
   ArrowRight
 } from "lucide-react";
-import { AppState, BlockId, CompanyData, ChatMessage, AppFilters, CustomBlock } from "./types";
+import { AppState, BlockId, CompanyData, ChatMessage, AppFilters, CustomBlock, SetupState, ClarifyStep, ResolvedApp, UnderstandIntent, ReportStatus } from "./types";
 import { ReportBrief } from "./components/ReportBrief";
 import { ReportHeader } from "./components/ReportHeader";
 import { ReportChatPane } from "./components/ReportChatPane";
@@ -51,13 +51,31 @@ const ALL_BLOCK_INFOS: { id: BlockId; name: string; description: string }[] = [
   { id: "actions", name: "Action Proposals", description: "PO / QA / Marketing tactical actions list" }
 ];
 
-const STEP_LABELS = [
-  "Parsing request",
-  "Selecting sources", 
-  "Scraping data", 
-  "Analysing reviews", 
-  "Building insights report"
-];
+const DEFAULT_SETUP_STATE: SetupState = {
+  sessionId: null,
+  currentStep: 0,
+  reason: null,
+  steps: [],
+  answers: {},
+  intent: null,
+  apps: [],
+  summary: "",
+};
+
+const TIME_RANGE_LABELS: Record<string, string> = {
+  last_7_days: "7d",
+  last_30_days: "30d",
+  last_90_days: "90d",
+};
+
+const SOURCE_LABELS: Record<string, string> = {
+  app_store: "App Store",
+  google_play: "Google Play",
+  youtube: "YouTube",
+  tinhte: "Tinhte",
+  voz: "Voz",
+  reddit: "Reddit",
+};
 
 export default function App() {
   // State Initialization from LocalStorage
@@ -86,16 +104,20 @@ export default function App() {
       },
       data: {},
       chatHistory: [],
-      customBlocks: []
+      customBlocks: [],
+      setup: DEFAULT_SETUP_STATE,
+      reportId: null,
+      reportStatus: undefined,
+      market: null,
     };
   });
 
   // UI state variables
   const [searchInput, setSearchInput] = useState("");
-  const [currentStepIndex, setCurrentStepIndex] = useState(0);
   const [chatInput, setChatInput] = useState("");
   const [isClassifying, setIsClassifying] = useState(false);
   const [alertMessage, setAlertMessage] = useState<string | null>(null);
+  const [loadingMessage, setLoadingMessage] = useState("Starting analysis...");
   const [isChatPaneOpen, setIsChatPaneOpen] = useState(true);
   const [openDrawers, setOpenDrawers] = useState<{ [id: string]: boolean }>({});
 
@@ -117,23 +139,49 @@ export default function App() {
 
   // Human-in-the-loop confirmation state hooks
   const [isPreparingConfirm, setIsPreparingConfirm] = useState(false);
-  const [confirmPrimary, setConfirmPrimary] = useState("");
-  const [confirmCompetitors, setConfirmCompetitors] = useState<string[]>([]);
-  const [selectedCompetitors, setSelectedCompetitors] = useState<string[]>([]);
-  const [customCompetitorInput, setCustomCompetitorInput] = useState("");
-  const [confirmQuestions, setConfirmQuestions] = useState<{ id: string; question: string; choices: string[] }[]>([]);
-  const [confirmAnswers, setConfirmAnswers] = useState<{ [qId: string]: string }>({});
-  const [confirmSources, setConfirmSources] = useState<string[]>(["App Store", "Google Play"]);
-  const [confirmDateRange, setConfirmDateRange] = useState<"7d" | "30d" | "90d">("30d");
-  const [setupStep, setSetupStep] = useState(0);
+  const [customStepInput, setCustomStepInput] = useState<Record<string, string>>({});
 
   const containerRef = useRef<HTMLDivElement>(null);
   const bottomChatRef = useRef<HTMLDivElement>(null);
+
+  const setup = state.setup ?? DEFAULT_SETUP_STATE;
 
   // Sync to local storage
   useEffect(() => {
     localStorage.setItem("market_research_agent_state", JSON.stringify(state));
   }, [state]);
+
+  const updateSetup = (updater: (prev: SetupState) => SetupState) => {
+    setState((prev) => ({
+      ...prev,
+      setup: updater(prev.setup ?? DEFAULT_SETUP_STATE),
+    }));
+  };
+
+  const resetSetup = () => {
+    setCustomStepInput({});
+    updateSetup(() => ({ ...DEFAULT_SETUP_STATE }));
+  };
+
+  const currentStep = setup.steps[setup.currentStep] ?? null;
+
+  const getAnswerLabel = (value: string) => {
+    return SOURCE_LABELS[value] ?? value.replace(/_/g, " ");
+  };
+
+  const currentStepHasAnswer = () => {
+    if (!currentStep) {
+      return false;
+    }
+    const value = setup.answers[currentStep.step_id];
+    if (Array.isArray(value)) {
+      return value.length > 0;
+    }
+    if (typeof value === "boolean") {
+      return true;
+    }
+    return typeof value === "string" && value.trim().length > 0;
+  };
 
   const getCrawlLogsForCompanies = () => {
     const list: { company: string; source: string; text: string; stars: number; date: string }[] = [];
@@ -168,30 +216,79 @@ export default function App() {
     return list;
   };
 
-  // Handle loading state step counter
-  useEffect(() => {
-    let interval: NodeJS.Timeout;
-    if (state.phase === "loading") {
-      interval = setInterval(() => {
-        setCurrentStepIndex((prev) => {
-          if (prev < STEP_LABELS.length - 1) {
-            return prev + 1;
-          }
-          return prev;
-        });
-      }, 1500);
-    } else {
-      setCurrentStepIndex(0);
-    }
-    return () => clearInterval(interval);
-  }, [state.phase]);
-
   // Scroll to new chat elements automatically
   useEffect(() => {
     if (state.phase === "report") {
       bottomChatRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [state.chatHistory, state.phase]);
+
+  useEffect(() => {
+    if (state.phase !== "loading" || !state.reportId) {
+      return;
+    }
+
+    const evtSource = new EventSource(`/api/reports/${state.reportId}/stream`);
+
+    const fetchReport = async () => {
+      const reportRes = await fetch(`/api/reports/${state.reportId}`);
+      if (!reportRes.ok) {
+        throw new Error("Could not load completed report.");
+      }
+      const report = await reportRes.json();
+      setState((prev) => ({
+        ...prev,
+        phase: "report",
+        reportStatus: report.status as ReportStatus,
+        companies: Object.keys(report.data || {}),
+        data: report.data || {},
+        market: report.market || null,
+        chatHistory: [
+          {
+            id: `sys-${Date.now()}`,
+            role: "agent",
+            text: `Analysis complete. ${Object.keys(report.data || {}).length} apps analyzed with real review data.`,
+            timestamp: Date.now(),
+          },
+        ],
+      }));
+    };
+
+    const handleProgress = (event: MessageEvent) => {
+      const payload = JSON.parse(event.data);
+      setLoadingMessage(payload.message || "Analysis in progress...");
+      setState((prev) => ({
+        ...prev,
+        reportStatus: "running",
+      }));
+    };
+
+    const handleDone = async () => {
+      evtSource.close();
+      await fetchReport();
+    };
+
+    const handleError = () => {
+      evtSource.close();
+      setAlertMessage("Crawl failed. Please try again.");
+      setState((prev) => ({
+        ...prev,
+        phase: "confirm",
+        reportStatus: "error",
+      }));
+    };
+
+    evtSource.addEventListener("fetch", handleProgress);
+    evtSource.addEventListener("classify", handleProgress);
+    evtSource.addEventListener("aggregate", handleProgress);
+    evtSource.addEventListener("insight", handleProgress);
+    evtSource.addEventListener("done", handleDone);
+    evtSource.addEventListener("error", handleError);
+
+    return () => {
+      evtSource.close();
+    };
+  }, [state.phase, state.reportId]);
 
   // Reset to landing page
   const handleReset = () => {
@@ -207,13 +304,19 @@ export default function App() {
       },
       data: {},
       chatHistory: [],
-      customBlocks: []
+      customBlocks: [],
+      setup: DEFAULT_SETUP_STATE,
+      reportId: null,
+      reportStatus: undefined,
+      market: null,
     });
     setSearchInput("");
     setChatInput("");
     setCustomBlockTitle("");
     setCustomBlockPrompt("");
     setIsAddingBlock(false);
+    setCustomStepInput({});
+    setLoadingMessage("Starting analysis...");
   };
 
   const handleGeneratePDF = () => {
@@ -263,69 +366,135 @@ export default function App() {
     }
   };
 
-  // Prepare Confirmation Parameters (Human-in-the-loop preparation step)
+  const hydrateSetupFromResponse = (queryText: string, data: any) => {
+    if (data?.phase === "clarify") {
+      const nextSteps: ClarifyStep[] = Array.isArray(data?.steps) ? data.steps : [];
+      const nextAnswers = nextSteps.reduce((acc: SetupState["answers"], step) => {
+        const previous = setup.answers[step.step_id];
+        if (previous !== undefined) {
+          acc[step.step_id] = previous;
+          return acc;
+        }
+        if (step.question.type === "multi_select" && step.question.recommended) {
+          acc[step.step_id] = [step.question.recommended];
+          return acc;
+        }
+        if (step.question.recommended) {
+          acc[step.step_id] = step.question.recommended;
+        }
+        return acc;
+      }, {});
+
+      setState((prev) => ({
+        ...prev,
+        phase: "clarify",
+        query: queryText,
+        setup: {
+          ...(prev.setup ?? DEFAULT_SETUP_STATE),
+          sessionId: data.session_id ?? prev.setup?.sessionId ?? null,
+          currentStep: 0,
+          reason: data.reason ?? null,
+          steps: nextSteps,
+          answers: nextAnswers,
+          intent: null,
+          apps: [],
+          summary: "",
+        },
+      }));
+      return;
+    }
+
+    if (data?.phase === "confirm") {
+      setState((prev) => ({
+        ...prev,
+        phase: "confirm",
+        query: queryText,
+        setup: {
+          ...(prev.setup ?? DEFAULT_SETUP_STATE),
+          sessionId: data.session_id ?? prev.setup?.sessionId ?? null,
+          currentStep: 0,
+          reason: null,
+          steps: prev.setup?.steps ?? [],
+          answers: prev.setup?.answers ?? {},
+          intent: data.intent ?? null,
+          apps: Array.isArray(data.apps) ? data.apps : [],
+          summary: data.summary ?? "",
+        },
+      }));
+      return;
+    }
+
+    throw new Error(data?.message || "Unexpected understand response.");
+  };
+
+  const requestUnderstand = async (payload: { query?: string; answers?: Record<string, string | string[] | boolean>; session_id?: string | null }) => {
+    const res = await fetch("/api/understand", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await res.json();
+    console.log("[voc-debug] understand:response", {
+      ok: res.ok,
+      status: res.status,
+      data,
+    });
+
+    if (!res.ok) {
+      throw new Error(data?.details || data?.message || data?.error || "Could not understand this request.");
+    }
+
+    return data;
+  };
+
   const prepareConfirmation = async (queryText: string) => {
     if (!queryText.trim()) return;
+    console.log("[voc-debug] understand:start", { queryText });
 
-    // Immediately put UI into confirmation phase
+    setAlertMessage(null);
+    setSearchInput(queryText);
+    setIsPreparingConfirm(true);
     setState((prev) => ({
       ...prev,
-      phase: "confirm",
-      query: queryText
+      phase: "clarify",
+      query: queryText,
+      setup: {
+        ...DEFAULT_SETUP_STATE,
+      },
     }));
-    setIsPreparingConfirm(true);
-    setSearchInput(queryText);
-    setSetupStep(0);
 
     try {
-      const res = await fetch("/api/prepare_confirmation", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: queryText })
-      });
-
-      if (!res.ok) {
-        throw new Error("Could not load preview questions.");
-      }
-
-      const data = await res.json();
-      setConfirmPrimary(data.primaryProduct || queryText);
-      setConfirmCompetitors(data.suggestedCompetitors || []);
-      setSelectedCompetitors(data.suggestedCompetitors || []);
-      setConfirmQuestions(data.suggestedQuestions || []);
-
-      const initialAnswers: { [qId: string]: string } = {};
-      if (data.suggestedQuestions) {
-        data.suggestedQuestions.forEach((q: any) => {
-          if (q.choices && q.choices.length > 0) {
-            initialAnswers[q.id] = q.choices[0];
-          }
-        });
-      }
-      setConfirmAnswers(initialAnswers);
+      const data = await requestUnderstand({ query: queryText });
+      hydrateSetupFromResponse(queryText, data);
     } catch (err: any) {
-      console.error(err);
-      // Fallback
-      setConfirmPrimary(queryText);
-      setConfirmCompetitors(["MoMo", "VNPay"]);
-      setSelectedCompetitors(["MoMo", "VNPay"]);
-      const fallbackQuestions = [
-        {
-          id: "q_focus",
-          question: "Which topic is your prime focus for this review exploration?",
-          choices: ["Transaction failures & speed", "UI/UX & usability issues", "Rewards & promo satisfaction"]
-        },
-        {
-          id: "q_scope",
-          question: "What is your primary analytical objective?",
-          choices: ["QA debugging & bug sweeps", "Direct competitor feature gap benchmark", "Product roadmap design"]
-        }
-      ];
-      setConfirmQuestions(fallbackQuestions);
-      setConfirmAnswers({
-        q_focus: "Transaction failures & speed",
-        q_scope: "QA debugging & bug sweeps"
+      console.error("[voc-debug] understand:error", err);
+      setAlertMessage(err?.message || "Could not load setup questions.");
+      setState((prev) => ({ ...prev, phase: "search" }));
+      resetSetup();
+    } finally {
+      setIsPreparingConfirm(false);
+    }
+  };
+
+  const submitClarification = async () => {
+    if (!state.query.trim()) {
+      return;
+    }
+
+    setAlertMessage(null);
+    setIsPreparingConfirm(true);
+
+    try {
+      const data = await requestUnderstand({
+        query: state.query,
+        answers: setup.answers,
+        session_id: setup.sessionId,
       });
+      hydrateSetupFromResponse(state.query, data);
+    } catch (err: any) {
+      console.error("[voc-debug] clarify:error", err);
+      setAlertMessage(err?.message || "Could not continue setup.");
     } finally {
       setIsPreparingConfirm(false);
     }
@@ -333,68 +502,65 @@ export default function App() {
 
   // Run full analysis on a query utilizing human-confirmed parameters
   const runAnalysis = async () => {
-    setState((prev) => ({
-      ...prev,
-      phase: "loading"
-    }));
+    const intent = setup.intent as UnderstandIntent | null;
+    const selectedApps = setup.apps as ResolvedApp[];
+    if (!intent || selectedApps.length === 0) {
+      setAlertMessage("Please keep at least one verified app before starting analysis.");
+      return;
+    }
 
-    // Synthesize target focus string from user's answers
-    const answersText = Object.entries(confirmAnswers)
-      .map(([qId, ans]) => {
-        const q = confirmQuestions.find(cq => cq.id === qId);
-        return q ? `${q.question}: "${ans}"` : ans;
+    const sourceLabels = (intent.data_sources.length > 0 ? intent.data_sources : ["app_store", "google_play"]).map((source) => getAnswerLabel(source));
+    const dateRange = TIME_RANGE_LABELS[intent.filters.time_range] ?? "90d";
+    const answersText = Object.entries(setup.answers)
+      .map(([stepId, answer]) => {
+        const step = setup.steps.find((item) => item.step_id === stepId);
+        const formatted = Array.isArray(answer) ? answer.join(", ") : String(answer);
+        return step ? `${step.question.question}: "${formatted}"` : formatted;
       })
       .join(". ");
 
-    const compositeFocus = `Target Product: ${confirmPrimary}. Focus objective: ${answersText}. Customized parameters: Date Range: ${confirmDateRange}, Sources: ${confirmSources.join(", ")}.`;
+    const compositeFocus = `Target Product: ${intent.subject}. Focus: ${intent.focus}. Objective: ${intent.objective}. Audience: ${intent.audience}. Data Sources: ${sourceLabels.join(", ")}. Time Range: ${intent.filters.time_range}. ${answersText}`.trim();
 
-    const allCompanies = Array.from(new Set([confirmPrimary, ...selectedCompetitors])).filter(Boolean);
+    setState((prev) => ({
+      ...prev,
+      phase: "loading",
+      reportId: null,
+      reportStatus: "pending",
+    }));
+    setLoadingMessage("Starting analysis...");
 
     try {
       const response = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          query: confirmPrimary,
-          companies: allCompanies,
-          focusArea: compositeFocus
+          confirmed_apps: selectedApps,
+          intent: {
+            ...intent,
+            focus: compositeFocus,
+          },
         })
       });
 
       if (!response.ok) {
         throw new Error("Analysis failed. Please verify your connection.");
       }
-
       const result = await response.json();
-      
+
       setState((prev) => ({
         ...prev,
-        phase: "report",
-        query: confirmPrimary,
-        companies: result.companies,
+        query: intent.subject,
         filters: {
           ...prev.filters,
-          dateRange: confirmDateRange,
-          sources: confirmSources
+          dateRange: dateRange as AppFilters["dateRange"],
+          sources: sourceLabels,
         },
-        data: {
-          ...prev.data,
-          ...result.data
-        },
-        chatHistory: [
-          ...prev.chatHistory,
-          {
-            id: `sys-${Date.now()}`,
-            role: "agent",
-            text: `Welcome! I've analyzed reviews and public app feedback for **${result.targetCompany}** under your specified focus: *"${answersText}"*.\n\nI've initialized your report dashboard with available metric blocks. You can ask questions or add more products/charts below.`,
-            timestamp: Date.now()
-          }
-        ]
+        reportId: result.report_id,
       }));
     } catch (err: any) {
       console.error(err);
       setAlertMessage(err.message || "Could not complete parsing request. Please retry.");
-      setState((prev) => ({ ...prev, phase: "search" }));
+      setState((prev) => ({ ...prev, phase: "confirm" }));
     }
   };
 
@@ -408,6 +574,77 @@ export default function App() {
   const handleChipClick = (suggestion: string) => {
     setSearchInput(suggestion);
     prepareConfirmation(suggestion);
+  };
+
+  const setStepAnswer = (stepId: string, value: string | string[] | boolean) => {
+    updateSetup((prev) => ({
+      ...prev,
+      answers: {
+        ...prev.answers,
+        [stepId]: value,
+      },
+    }));
+  };
+
+  const toggleMultiSelectChoice = (stepId: string, choice: string) => {
+    const current = setup.answers[stepId];
+    const next = Array.isArray(current) ? [...current] : [];
+    const index = next.indexOf(choice);
+    if (index >= 0) {
+      next.splice(index, 1);
+    } else {
+      next.push(choice);
+    }
+    setStepAnswer(stepId, next);
+  };
+
+  const addCustomChoiceToStep = (stepId: string) => {
+    const value = customStepInput[stepId]?.trim();
+    if (!value) {
+      return;
+    }
+
+    if (currentStep?.question.type === "multi_select") {
+      const existing = setup.answers[stepId];
+      const next = Array.isArray(existing) ? existing : [];
+      if (!next.includes(value)) {
+        setStepAnswer(stepId, [...next, value]);
+      }
+    } else {
+      setStepAnswer(stepId, value);
+    }
+
+    setCustomStepInput((prev) => ({ ...prev, [stepId]: "" }));
+  };
+
+  const handleWizardContinue = async () => {
+    if (state.phase === "clarify") {
+      if (setup.currentStep < setup.steps.length - 1) {
+        updateSetup((prev) => ({ ...prev, currentStep: prev.currentStep + 1 }));
+        return;
+      }
+      await submitClarification();
+      return;
+    }
+
+    if (state.phase === "confirm") {
+      runAnalysis();
+    }
+  };
+
+  const handleWizardBack = () => {
+    if (state.phase === "clarify" && setup.currentStep > 0) {
+      updateSetup((prev) => ({ ...prev, currentStep: prev.currentStep - 1 }));
+      return;
+    }
+    setState((prev) => ({ ...prev, phase: "search" }));
+  };
+
+  const removeResolvedApp = (name: string) => {
+    updateSetup((prev) => ({
+      ...prev,
+      apps: prev.apps.filter((app) => app.name !== name),
+    }));
   };
 
   const handleToggleBlock = (blockId: BlockId) => {
@@ -729,7 +966,7 @@ export default function App() {
       )}
 
       {/* PHASE 1.2: HUMAN-IN-THE-LOOP REFINEMENT/CONFIRMATION WORKSPACE */}
-      {state.phase === "confirm" && (
+      {(state.phase === "clarify" || state.phase === "confirm") && (
         <div className="min-h-screen py-12 px-4 md:px-8 max-w-4xl mx-auto flex flex-col justify-center animate-fade-in">
           {isPreparingConfirm ? (
             <div className="text-center py-16 bg-white rounded-3xl border border-gray-100 shadow-xl p-8 max-w-md mx-auto">
@@ -741,45 +978,37 @@ export default function App() {
               </div>
               <h2 className="text-lg font-medium text-slate-800 mb-2">Analyzing Query</h2>
               <p className="text-xs text-slate-500 leading-relaxed">
-                Gemini is parsing product context, mapping category benchmarks, and designing focus-group questions...
+                OpenClaw is parsing product context and shaping the next research step...
               </p>
             </div>
           ) : (
-            <div className="bg-white rounded-3xl border border-gray-200/80 shadow-2xl overflow-hidden flex flex-col md:flex-row h-auto md:h-[620px] max-w-4xl mx-auto w-full">
-              
-              {/* Left Sidebar Steps Map */}
-              <div className="w-full md:w-64 bg-slate-50 border-r border-gray-150 p-6 flex flex-col justify-between shrink-0">
+            <div className="bg-white rounded-3xl border border-gray-200/80 shadow-2xl overflow-hidden flex flex-col md:flex-row min-h-[760px] md:h-[760px] max-w-4xl mx-auto w-full">
+              <div className="w-full md:w-64 bg-slate-50 border-r border-gray-150 p-6 flex flex-col justify-between shrink-0 md:h-full">
                 <div className="space-y-6">
                   <div>
                     <div className="flex items-center gap-1.5 mb-1">
                       <Bot className="w-4 h-4 text-blue-600 animate-pulse" />
                       <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Setup Assistant</span>
                     </div>
-                    <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">Analysis Steps</h3>
+                    <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider">Setup Steps</h3>
                   </div>
-
-                  {/* Progress Indicator Track */}
-                  <div className="space-y-2.5">
-                    {[
-                      { label: "Focus Product", stepIndex: 0 },
-                      { label: "Competitors", stepIndex: 1 },
-                      { label: "Scraper Scope", stepIndex: 2 },
-                      ...confirmQuestions.map((q, idx) => ({
-                        label: q.question.length > 22 ? q.question.substring(0, 20) + "..." : q.question,
-                        stepIndex: 3 + idx
-                      })),
-                      { label: "Launch synthesis", stepIndex: 3 + (confirmQuestions ? confirmQuestions.length : 0) }
-                    ].map((step, idx) => {
-                      const isActive = setupStep === step.stepIndex;
-                      const isCompleted = setupStep > step.stepIndex;
-                      const qCount = confirmQuestions ? confirmQuestions.length : 0;
+                  <div className="space-y-2.5 md:max-h-[560px] md:overflow-y-auto pr-1">
+                    {(state.phase === "clarify"
+                      ? setup.steps.map((step, idx) => ({
+                          label: step.title,
+                          stepIndex: idx,
+                        }))
+                      : [{ label: "Confirm Plan", stepIndex: 0 }]
+                    ).map((step, idx) => {
+                      const isActive = state.phase === "clarify" ? setup.currentStep === step.stepIndex : true;
+                      const isCompleted = state.phase === "clarify" ? setup.currentStep > step.stepIndex : false;
                       return (
                         <button
                           key={idx}
                           type="button"
                           onClick={() => {
-                            if (step.stepIndex <= 3 + qCount) {
-                              setSetupStep(step.stepIndex);
+                            if (state.phase === "clarify") {
+                              updateSetup((prev) => ({ ...prev, currentStep: step.stepIndex }));
                             }
                           }}
                           className={`w-full flex items-center gap-3 text-left p-2 rounded-xl text-xs font-semibold transition-all cursor-pointer border border-transparent ${
@@ -805,317 +1034,265 @@ export default function App() {
                     })}
                   </div>
                 </div>
-
-                {/* Micro cancellation control */}
                 <div className="pt-4 border-t border-gray-200/60 mt-6">
                   <button
-                    onClick={() => setState((prev) => ({ ...prev, phase: "search" }))}
+                    onClick={handleReset}
                     className="text-[10px] font-bold uppercase tracking-widest text-slate-400 hover:text-red-500 transition-colors cursor-pointer block"
                   >
                     Cancel Setup &amp; Reset
                   </button>
                 </div>
               </div>
-
-              {/* Right Panel Main Interactive Workspace */}
               <div className="flex-1 flex flex-col justify-between p-6 md:p-8 bg-white h-full min-h-0">
-                <div className="flex-1 overflow-y-auto pr-2 min-h-0 mb-4">
-                  {/* Top Progress Bar */}
+                <div className="flex-1 overflow-y-auto pr-2 min-h-[520px] md:min-h-0 mb-4">
                   <div className="mb-6">
                     <div className="flex justify-between items-center mb-1.5 text-[11px] font-bold text-slate-400 uppercase tracking-wider">
                       <span>Setup Progress</span>
                       <span className="text-blue-600 font-mono">
-                        {Math.round(((setupStep + 1) / (4 + (confirmQuestions ? confirmQuestions.length : 0))) * 100)}%
+                        {state.phase === "clarify"
+                          ? `${Math.round((((setup.currentStep || 0) + 1) / Math.max(setup.steps.length, 1)) * 100)}%`
+                          : "100%"}
                       </span>
                     </div>
                     <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
                       <div 
                         className="bg-blue-600 h-full transition-all duration-300 rounded-full"
-                        style={{ width: `${Math.round(((setupStep + 1) / (4 + (confirmQuestions ? confirmQuestions.length : 0))) * 100)}%` }}
+                        style={{
+                          width:
+                            state.phase === "clarify"
+                              ? `${Math.round((((setup.currentStep || 0) + 1) / Math.max(setup.steps.length, 1)) * 100)}%`
+                              : "100%",
+                        }}
                       />
                     </div>
                   </div>
 
-                  {/* Agent Bubble Intro */}
                   <div className="flex items-start gap-3 mb-6">
                     <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-white shrink-0 shadow-sm">
                       <Bot className="w-4 h-4" />
                     </div>
                     <div className="bg-slate-50 border border-slate-100 p-3.5 rounded-2xl rounded-tl-none max-w-lg shadow-2xs">
                       <p className="text-xs text-slate-705 leading-relaxed font-sans font-medium">
-                        {setupStep === 0 && "First, let's verify our analysis focus app. What is the exact primary product or mobile app you want me to search reviews for?"}
-                        {setupStep === 1 && "Excellent. To compile benchmarking metrics and comparison matrices, which key competitors or peers should I scrape and evaluate alongside?"}
-                        {setupStep === 2 && "Now let's configure the review timeframe and source feeds. How far back should I crawl, and which store feeds should I process?"}
-                        {setupStep >= 3 && setupStep < 3 + (confirmQuestions ? confirmQuestions.length : 0) && (confirmQuestions[setupStep - 3]?.question || "Custom Focus Guidelines")}
-                        {setupStep === 3 + (confirmQuestions ? confirmQuestions.length : 0) && "Awesome! I have compiled your custom investigation scope and am ready to run the Gemini analysis engines."}
+                        {state.phase === "clarify"
+                          ? currentStep?.question.question || "Let's refine this request before we start."
+                          : "I've compiled the research intent and verified the apps I could confidently match from the stores. Please confirm the plan before analysis begins."}
                       </p>
                     </div>
                   </div>
 
-                  {/* ACTIVE STEP CONTROLS BOX */}
-                  <div className="py-2">
-                    
-                    {/* STEP 0: PRIMARY PRODUCT EDIT */}
-                    {setupStep === 0 && (
-                      <div className="space-y-3">
+                  <div className="py-2 min-h-[340px] flex flex-col">
+                    {state.phase === "clarify" && currentStep && (
+                      <div className="space-y-4 flex-1">
+                        {setup.reason && (
+                          <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+                            {setup.reason}
+                          </div>
+                        )}
                         <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                          Primary Target App / Brand
+                          {currentStep.title}
                         </label>
-                        <input
-                          type="text"
-                          className="w-full px-4 py-3 bg-white border border-gray-250 focus:outline-none focus:ring-2 focus:ring-blue-500/10 focus:border-blue-500 rounded-xl text-xs font-semibold text-slate-800 shadow-2xs"
-                          value={confirmPrimary}
-                          onChange={(e) => setConfirmPrimary(e.target.value)}
-                          placeholder="e.g. MoMo, VNPay"
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") {
-                              e.preventDefault();
-                              if (confirmPrimary.trim()) {
-                                setSetupStep(1);
-                              }
-                            }
-                          }}
-                        />
-                        <p className="text-[10px] text-slate-400 leading-normal">
-                          Press Enter or click continue to configure competitors and sources.
-                        </p>
-                      </div>
-                    )}
 
-                    {/* STEP 1: COMPETITORS SELECTION */}
-                    {setupStep === 1 && (
-                      <div className="space-y-4">
-                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                          Suggested Peer Benchmarks
-                        </label>
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                          {confirmCompetitors.map((comp) => {
-                            const isChecked = selectedCompetitors.includes(comp);
-                            return (
-                              <button
-                                key={comp}
-                                type="button"
-                                onClick={() => {
-                                  if (isChecked) {
-                                    setSelectedCompetitors(prev => prev.filter(p => p !== comp));
-                                  } else {
-                                    setSelectedCompetitors(prev => [...prev, comp]);
-                                  }
-                                }}
-                                className={`flex items-center justify-between text-left px-3.5 py-2.5 rounded-xl border transition-all cursor-pointer ${
-                                  isChecked
-                                    ? "bg-blue-50 border-blue-400 text-blue-900 font-bold"
-                                    : "bg-white border-gray-200 hover:bg-slate-50 text-slate-700 font-medium text-xs"
-                                }`}
-                              >
-                                <span className="text-xs">{comp}</span>
-                                <div className={`w-4 h-4 rounded border flex items-center justify-center transition-all ${isChecked ? "bg-blue-600 border-blue-600 text-white" : "border-slate-300 bg-white"}`}>
-                                  {isChecked && <Check className="w-2.5 h-2.5 stroke-[3]" />}
-                                </div>
-                              </button>
-                            );
-                          })}
-                        </div>
-
-                        {/* Custom Input */}
-                        <div className="flex gap-2.5 pt-1.5">
+                        {currentStep.question.type === "text" && (
                           <input
                             type="text"
-                            className="flex-1 px-3.5 py-2 text-xs rounded-xl border border-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white placeholder-gray-400 text-slate-850"
-                            placeholder="Add other competitor (e.g. ShopeePay)"
-                            value={customCompetitorInput}
-                            onChange={(e) => setCustomCompetitorInput(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") {
-                                e.preventDefault();
-                                if (customCompetitorInput.trim()) {
-                                  const clean = customCompetitorInput.trim();
-                                  if (!selectedCompetitors.includes(clean)) setSelectedCompetitors(p => [...p, clean]);
-                                  if (!confirmCompetitors.includes(clean)) setConfirmCompetitors(p => [...p, clean]);
-                                  setCustomCompetitorInput("");
-                                }
-                              }
-                            }}
+                            className="w-full px-4 py-3 bg-white border border-gray-250 focus:outline-none focus:ring-2 focus:ring-blue-500/10 focus:border-blue-500 rounded-xl text-xs font-semibold text-slate-800 shadow-2xs"
+                            value={typeof setup.answers[currentStep.step_id] === "string" ? String(setup.answers[currentStep.step_id]) : ""}
+                            onChange={(e) => setStepAnswer(currentStep.step_id, e.target.value)}
+                            placeholder={typeof currentStep.question.recommended === "string" ? currentStep.question.recommended : "Type your answer"}
                           />
-                          <button
-                            type="button"
-                            onClick={() => {
-                              if (customCompetitorInput.trim()) {
-                                const clean = customCompetitorInput.trim();
-                                if (!selectedCompetitors.includes(clean)) setSelectedCompetitors(p => [...p, clean]);
-                                if (!confirmCompetitors.includes(clean)) setConfirmCompetitors(p => [...p, clean]);
-                                setCustomCompetitorInput("");
-                              }
-                            }}
-                            className="px-4 py-2 bg-slate-100 hover:bg-slate-205 text-slate-800 text-xs font-bold rounded-xl transition cursor-pointer"
-                          >
-                            + Add App
-                          </button>
-                        </div>
-                      </div>
-                    )}
+                        )}
 
-                    {/* STEP 2: INVESTIGATION SCOPE */}
-                    {setupStep === 2 && (
-                      <div className="space-y-4">
-                        <div>
-                          <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">
-                            Review Horizon Timeframe
-                          </label>
-                          <div className="grid grid-cols-3 gap-2">
-                            {(["7d", "30d", "90d"] as const).map((range) => {
-                              const isSel = confirmDateRange === range;
-                              const labels = { "7d": "7 Days", "30d": "30 Days", "90d": "90 Days" };
-                              return (
-                                <button
-                                  key={range}
-                                  type="button"
-                                  onClick={() => setConfirmDateRange(range)}
-                                  className={`py-2 text-center text-xs font-bold rounded-xl border transition cursor-pointer ${
-                                    isSel
-                                      ? "bg-blue-600 text-white border-blue-600"
-                                      : "bg-white text-slate-600 border-gray-200 hover:bg-slate-50"
-                                  }`}
-                                >
-                                  {labels[range]}
-                                </button>
-                              );
-                            })}
+                        {currentStep.question.type === "single_select" && (
+                          <div className="space-y-3">
+                            <div className="flex flex-col gap-2">
+                              {currentStep.question.choices.map((choice) => {
+                                const isSelected = setup.answers[currentStep.step_id] === choice;
+                                return (
+                                  <button
+                                    key={choice}
+                                    type="button"
+                                    onClick={() => setStepAnswer(currentStep.step_id, choice)}
+                                    className={`text-left text-xs p-3 rounded-xl border transition-all duration-150 flex items-center justify-between cursor-pointer ${
+                                      isSelected
+                                        ? "bg-blue-50 border-blue-400 text-blue-900 font-bold"
+                                        : "bg-white border-gray-200 hover:bg-slate-50 text-slate-700"
+                                    }`}
+                                  >
+                                    <span>{choice}</span>
+                                    <div className={`w-4 h-4 rounded-full border flex items-center justify-center shrink-0 ${isSelected ? "border-blue-600 bg-blue-600 text-white" : "border-slate-300 bg-white"}`}>
+                                      {isSelected && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
+                                    </div>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                            {currentStep.question.allow_other && (
+                              <input
+                                type="text"
+                                className="w-full px-4 py-3 rounded-xl border border-gray-200 text-xs"
+                                placeholder="Or type your own answer"
+                                value={customStepInput[currentStep.step_id] ?? (typeof setup.answers[currentStep.step_id] === "string" && !currentStep.question.choices.includes(String(setup.answers[currentStep.step_id])) ? String(setup.answers[currentStep.step_id]) : "")}
+                                onChange={(e) => {
+                                  const value = e.target.value;
+                                  setCustomStepInput((prev) => ({ ...prev, [currentStep.step_id]: value }));
+                                  setStepAnswer(currentStep.step_id, value);
+                                }}
+                              />
+                            )}
                           </div>
-                        </div>
+                        )}
 
-                        <div>
-                          <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">
-                            Active Scraping Sources
-                          </label>
-                          <div className="flex flex-wrap gap-2">
-                            {["App Store", "Google Play", "Public Feedback"].map((src) => {
-                              const isChecked = confirmSources.includes(src);
-                              return (
-                                <button
-                                  key={src}
-                                  type="button"
-                                  onClick={() => {
-                                    if (isChecked) {
-                                      setConfirmSources(prev => prev.filter(s => s !== src));
-                                    } else {
-                                      setConfirmSources(prev => [...prev, src]);
+                        {currentStep.question.type === "multi_select" && (
+                          <div className="space-y-3">
+                            <div className="flex flex-wrap gap-2">
+                              {currentStep.question.choices.map((choice) => {
+                                const selectedValues = Array.isArray(setup.answers[currentStep.step_id]) ? setup.answers[currentStep.step_id] as string[] : [];
+                                const isSelected = selectedValues.includes(choice);
+                                return (
+                                  <button
+                                    key={choice}
+                                    type="button"
+                                    onClick={() => toggleMultiSelectChoice(currentStep.step_id, choice)}
+                                    className={`px-3.5 py-2 rounded-full border text-xs font-semibold transition ${
+                                      isSelected ? "bg-blue-50 border-blue-400 text-blue-900" : "bg-white border-gray-200 text-slate-700"
+                                    }`}
+                                  >
+                                    {choice}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                            {currentStep.question.allow_other && (
+                              <div className="flex gap-2">
+                                <input
+                                  type="text"
+                                  className="flex-1 px-4 py-3 rounded-xl border border-gray-200 text-xs"
+                                  placeholder="Add another competitor"
+                                  value={customStepInput[currentStep.step_id] ?? ""}
+                                  onChange={(e) => setCustomStepInput((prev) => ({ ...prev, [currentStep.step_id]: e.target.value }))}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") {
+                                      e.preventDefault();
+                                      addCustomChoiceToStep(currentStep.step_id);
                                     }
                                   }}
-                                  className={`px-3.5 py-2 rounded-xl text-xs font-semibold border flex items-center gap-2 transition cursor-pointer ${
-                                    isChecked
-                                      ? "bg-slate-50 text-[#0b57d0] border-[#d3e3fd]"
-                                      : "bg-white text-slate-500 border-gray-200 hover:bg-slate-55"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => addCustomChoiceToStep(currentStep.step_id)}
+                                  className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold rounded-xl transition"
+                                >
+                                  Add
+                                </button>
+                              </div>
+                            )}
+                            {Array.isArray(setup.answers[currentStep.step_id]) && (setup.answers[currentStep.step_id] as string[]).length > 0 && (
+                              <div className="flex flex-wrap gap-2">
+                                {(setup.answers[currentStep.step_id] as string[]).map((value) => (
+                                  <span key={value} className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-3 py-1 text-[11px] font-semibold text-slate-700">
+                                    {value}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {currentStep.question.type === "boolean" && (
+                          <div className="flex gap-3">
+                            {[true, false].map((choice) => {
+                              const isSelected = setup.answers[currentStep.step_id] === choice;
+                              return (
+                                <button
+                                  key={String(choice)}
+                                  type="button"
+                                  onClick={() => setStepAnswer(currentStep.step_id, choice)}
+                                  className={`flex-1 rounded-xl border px-4 py-3 text-xs font-bold transition ${
+                                    isSelected ? "bg-blue-600 text-white border-blue-600" : "bg-white text-slate-700 border-gray-200"
                                   }`}
                                 >
-                                  <div className={`w-3.5 h-3.5 rounded-full border flex items-center justify-center ${isChecked ? "border-[#0b57d0]" : "border-slate-300"}`}>
-                                    {isChecked && <div className="w-1.5 h-1.5 rounded-full bg-blue-600"></div>}
-                                  </div>
-                                  <span>{src}</span>
+                                  {choice ? "Yes" : "No"}
                                 </button>
                               );
                             })}
                           </div>
-                        </div>
+                        )}
                       </div>
                     )}
 
-                    {/* STEP 3 to 2+L: DYNAMIC CUSTOM FOCUS QUESTIONS */}
-                    {setupStep >= 3 && setupStep < 3 + (confirmQuestions ? confirmQuestions.length : 0) && (
-                      <div className="space-y-2.5">
-                        <label className="block text-[10px] font-bold text-slate-400 tracking-widest uppercase">
-                          Tuning Options
-                        </label>
-                        <div className="flex flex-col gap-2">
-                          {(confirmQuestions[setupStep - 3]?.choices || []).map((choice) => {
-                            const qId = confirmQuestions[setupStep - 3].id;
-                            const isSelected = confirmAnswers[qId] === choice;
-                            return (
-                              <button
-                                key={choice}
-                                type="button"
-                                onClick={() => {
-                                  setConfirmAnswers(prev => ({
-                                    ...prev,
-                                    [qId]: choice
-                                  }));
-                                  // Auto advance after short delay
-                                  setTimeout(() => {
-                                    setSetupStep(prev => prev + 1);
-                                  }, 220);
-                                }}
-                                className={`text-left text-xs p-3 rounded-xl border transition-all duration-150 flex items-center justify-between cursor-pointer focus:outline-none ${
-                                  isSelected
-                                    ? "bg-blue-50 border-blue-400 text-blue-900 font-bold"
-                                    : "bg-white border-gray-200 hover:bg-slate-50 text-slate-700 font-normal"
-                                }`}
-                              >
-                                <span>{choice}</span>
-                                <div className={`w-4 h-4 rounded-full border flex items-center justify-center shrink-0 ${isSelected ? "border-blue-600 bg-blue-600 text-white" : "border-slate-300 bg-white"}`}>
-                                  {isSelected && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
-                                </div>
-                              </button>
-                            );
-                          })}
+                    {state.phase === "confirm" && (
+                      <div className="space-y-5 flex-1">
+                        <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                          <p className="text-xs leading-relaxed text-slate-700">{setup.summary || "Please review the generated analysis plan."}</p>
                         </div>
-                      </div>
-                    )}
 
-                    {/* STEP 3+L: SUMMARY PORTAL TO LAUNCH */}
-                    {setupStep === 3 + (confirmQuestions ? confirmQuestions.length : 0) && (
-                      <div className="space-y-4">
-                        <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                          Synthesis Overview Constraints
-                        </label>
-                        <div className="bg-slate-50 border border-gray-200/60 rounded-2xl p-4.5 space-y-3">
+                        {setup.intent && (
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                             <div className="bg-white p-3 rounded-xl border border-gray-150">
-                              <span className="block text-[9px] uppercase font-bold text-slate-400 tracking-wider mb-0.5">Target Wallet</span>
-                              <span className="text-xs font-bold text-slate-850">{confirmPrimary}</span>
+                              <span className="block text-[9px] uppercase font-bold text-slate-400 tracking-wider mb-0.5">Subject</span>
+                              <span className="text-xs font-bold text-slate-850">{setup.intent.subject}</span>
                             </div>
                             <div className="bg-white p-3 rounded-xl border border-gray-150">
-                              <span className="block text-[9px] uppercase font-bold text-slate-400 tracking-wider mb-0.5">Compared Peers</span>
-                              <span className="text-xs font-bold text-slate-850 truncate block">
-                                {selectedCompetitors.length > 0 ? selectedCompetitors.join(", ") : "Single-focus analysis (No peers)"}
-                              </span>
+                              <span className="block text-[9px] uppercase font-bold text-slate-400 tracking-wider mb-0.5">Audience</span>
+                              <span className="text-xs font-bold text-slate-850">{setup.intent.audience}</span>
                             </div>
                             <div className="bg-white p-3 rounded-xl border border-gray-150">
-                              <span className="block text-[9px] uppercase font-bold text-slate-400 tracking-wider mb-0.5">Analysis Horizon</span>
-                              <span className="text-xs font-bold text-slate-850">Last {confirmDateRange === "7d" ? "7 days" : confirmDateRange === "30d" ? "30 days" : "90 days"}</span>
+                              <span className="block text-[9px] uppercase font-bold text-slate-400 tracking-wider mb-0.5">Focus</span>
+                              <span className="text-xs font-bold text-slate-850">{setup.intent.focus}</span>
                             </div>
                             <div className="bg-white p-3 rounded-xl border border-gray-150">
-                              <span className="block text-[9px] uppercase font-bold text-slate-400 tracking-wider mb-0.5">Crawl Feeds</span>
-                              <span className="text-xs font-bold text-slate-850">{confirmSources.join(", ")}</span>
+                              <span className="block text-[9px] uppercase font-bold text-slate-400 tracking-wider mb-0.5">Objective</span>
+                              <span className="text-xs font-bold text-slate-850">{setup.intent.objective}</span>
                             </div>
                           </div>
+                        )}
 
-                          {confirmQuestions.length > 0 && (
-                            <div className="bg-white p-3.5 rounded-xl border border-gray-150 space-y-2">
-                              <span className="block text-[9px] uppercase font-bold text-slate-400 tracking-wider">AI Tuning Parameters:</span>
-                              <div className="space-y-2 divide-y divide-gray-100">
-                                {confirmQuestions.map((q) => (
-                                  <div key={q.id} className="pt-2 first:pt-0 text-[11px] leading-relaxed">
-                                    <span className="text-slate-500 block mb-0.5">{q.question}</span>
-                                    <span className="font-bold text-blue-750">✓ {confirmAnswers[q.id] || "Default Focus"}</span>
+                        <div className="space-y-3">
+                          <div className="flex items-center justify-between">
+                            <h3 className="text-xs font-bold uppercase tracking-widest text-slate-400">Verified Apps</h3>
+                            <span className="text-[11px] text-slate-400">{setup.apps.length} matched</span>
+                          </div>
+                          {setup.apps.length === 0 ? (
+                            <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 text-xs text-rose-700">
+                              I could not confidently verify any app on the public stores. Please go back and refine the product names.
+                            </div>
+                          ) : (
+                            <div className="space-y-3">
+                              {setup.apps.map((app) => (
+                                <div key={app.name} className="flex items-center gap-3 p-3 border rounded-xl">
+                                  {app.iconUrl ? (
+                                    <img src={app.iconUrl} alt={app.name} className="w-10 h-10 rounded-xl object-cover" />
+                                  ) : (
+                                    <div className="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center text-slate-400">
+                                      <Database className="w-4 h-4" />
+                                    </div>
+                                  )}
+                                  <div className="min-w-0">
+                                    <div className="font-medium text-sm text-slate-900">{app.name}</div>
+                                    <div className="text-xs text-gray-400">
+                                      {app.playId ? "Play Store ✓ " : ""}
+                                      {app.appStoreId ? "App Store ✓" : ""}
+                                    </div>
                                   </div>
-                                ))}
-                              </div>
+                                  <button onClick={() => removeResolvedApp(app.name)} className="ml-auto text-red-400 hover:text-red-600">
+                                    <X className="w-4 h-4" />
+                                  </button>
+                                </div>
+                              ))}
                             </div>
                           )}
                         </div>
                       </div>
                     )}
-
                   </div>
                 </div>
 
-                {/* BOTTOM WIZARD NAVIGATION FOOTER */}
                 <div className="border-t border-gray-150 pt-5 mt-6 flex justify-between items-center bg-white">
                   <div>
-                    {setupStep > 0 ? (
+                    {state.phase === "clarify" && setup.currentStep > 0 ? (
                       <button
                         type="button"
-                        onClick={() => setSetupStep(prev => prev - 1)}
+                        onClick={handleWizardBack}
                         className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl border border-gray-250 hover:bg-slate-50 text-slate-700 text-xs font-bold transition cursor-pointer"
                       >
                         <ArrowLeft className="w-3.5 h-3.5" />
@@ -1124,40 +1301,36 @@ export default function App() {
                     ) : (
                       <button
                         type="button"
-                        onClick={() => setState((prev) => ({ ...prev, phase: "search" }))}
+                        onClick={handleWizardBack}
                         className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl border border-gray-250 hover:bg-red-50 hover:text-red-700 text-slate-600 text-xs font-semibold transition cursor-pointer"
                       >
-                        Cancel Setup
+                        {state.phase === "confirm" ? "Start Over" : "Cancel Setup"}
                       </button>
                     )}
                   </div>
 
                   <div>
-                    {setupStep < 3 + (confirmQuestions ? confirmQuestions.length : 0) ? (
-                      <button
-                        type="button"
-                        disabled={setupStep === 0 && !confirmPrimary.trim()}
-                        onClick={() => setSetupStep(prev => prev + 1)}
-                        className="flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-bold transition shadow-xs cursor-pointer"
-                      >
-                        <span>Continue</span>
-                        <ArrowRight className="w-3.5 h-3.5" />
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={runAnalysis}
-                        className="px-6 py-2.5 text-xs font-extrabold rounded-xl bg-blue-600 hover:bg-blue-700 text-white shadow-md hover:shadow-lg transition-all flex items-center gap-2 cursor-pointer"
-                      >
-                        <Sparkles className="w-4 h-4" />
-                        <span>Launch Analysis Grid</span>
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      disabled={state.phase === "clarify" ? !currentStepHasAnswer() : setup.apps.length === 0}
+                      onClick={handleWizardContinue}
+                      className="flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-bold transition shadow-xs cursor-pointer"
+                    >
+                      {state.phase === "clarify" ? (
+                        <>
+                          <span>{setup.currentStep === setup.steps.length - 1 ? "Submit Answers" : "Continue"}</span>
+                          <ArrowRight className="w-3.5 h-3.5" />
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-4 h-4" />
+                          <span>Confirm &amp; Launch Analysis</span>
+                        </>
+                      )}
+                    </button>
                   </div>
                 </div>
-
               </div>
-
             </div>
           )}
         </div>
@@ -1175,36 +1348,18 @@ export default function App() {
               <Sparkles className="relative w-5 h-5 text-blue-600 animate-pulse" />
             </div>
 
-            <h2 className="text-xl font-light text-[#1F1F1F] mb-1">Synthesizing Public Reviews...</h2>
-            <p className="text-xs text-gray-450 mb-8 uppercase tracking-wide">Gathering app store assets &amp; social triggers</p>
+            <h2 className="text-xl font-light text-[#1F1F1F] mb-1">{loadingMessage || "Starting analysis..."}</h2>
+            <p className="text-xs text-gray-450 mb-8 uppercase tracking-wide">Crawling real reviews from app stores and forums</p>
 
-            {/* Step list transition display */}
-            <div className="space-y-3 bg-gray-50 p-5 rounded-xl text-left border border-gray-255">
-              {STEP_LABELS.map((label, idx) => {
-                const isActive = idx === currentStepIndex;
-                const isCompleted = idx < currentStepIndex;
-                return (
-                  <div
-                    key={idx}
-                    className={`flex items-center gap-3 text-xs transition-all duration-300 ${
-                      isActive ? "text-[#1F1F1F] font-semibold" : isCompleted ? "text-blue-600 opacity-80" : "text-gray-400 opacity-50"
-                    }`}
-                  >
-                    {isCompleted ? (
-                      <CheckCircle className="w-4 h-4 shrink-0 text-blue-600" />
-                    ) : isActive ? (
-                      <div className="w-4 h-4 rounded-full border-2 border-blue-600 border-t-transparent animate-spin shrink-0"></div>
-                    ) : (
-                      <span className="w-4 h-4 rounded-full bg-gray-200 flex items-center justify-center text-[9px] text-gray-500 shrink-0 font-bold">{idx + 1}</span>
-                    )}
-                    <span>{label}</span>
-                  </div>
-                );
-              })}
+            <div className="bg-gray-50 p-5 rounded-xl text-left border border-gray-255">
+              <div className="flex items-center gap-3 text-xs text-[#1F1F1F] font-semibold">
+                <div className="w-4 h-4 rounded-full border-2 border-blue-600 border-t-transparent animate-spin shrink-0"></div>
+                <span>{state.reportStatus === "running" ? "Pipeline is processing live data" : "Preparing crawler pipeline"}</span>
+              </div>
             </div>
 
             <div className="mt-8 text-[10px] text-gray-400 text-center uppercase">
-              Scraping from public indices &amp; forums live
+              Report ID {state.reportId || "pending"}
             </div>
           </div>
         </div>
@@ -2083,10 +2238,10 @@ export default function App() {
                         </button>
                       </div>
                     </form>
-                    <p className="text-center text-[9px] text-gray-400 mt-2 uppercase">
-                      Gemini feedback model is experimental
-                    </p>
-                  </div>
+        <p className="text-center text-[9px] text-gray-400 mt-2 uppercase">
+          OpenClaw task understanding is experimental
+        </p>
+      </div>
 
                 </aside>
               )}
@@ -2215,4 +2370,3 @@ export default function App() {
     </div>
   );
 }
-

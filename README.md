@@ -2,7 +2,7 @@
 
 AI VOC is a market research and voice-of-customer workspace for analyzing app review sentiment, surfacing pain points, and generating product actions for digital wallet and fintech competitors.
 
-The app combines a React frontend with an Express API layer that uses Gemini to:
+The app combines a React frontend with an Express API layer that uses an OpenAI-compatible chat completions API to:
 
 - turn a natural-language query into a research target and competitor set
 - synthesize sentiment and review analysis from seed data plus AI-generated fallback reports
@@ -23,7 +23,7 @@ The app combines a React frontend with an Express API layer that uses Gemini to:
 - TypeScript
 - Vite
 - Express
-- Gemini via `@google/genai`
+- OpenAI-compatible chat completions API
 
 ## Project Structure
 
@@ -40,7 +40,7 @@ The app combines a React frontend with an Express API layer that uses Gemini to:
 
 - Node.js 20+ recommended
 - npm 10+ recommended
-- A Gemini API key
+- An OpenAI-compatible API key, base URL, and model
 
 ## Getting Started
 
@@ -53,13 +53,15 @@ The app combines a React frontend with an Express API layer that uses Gemini to:
 2. Create a local environment file:
 
    ```bash
-   cp .env.example .env.local
+   cp .env.example .env
    ```
 
-3. Set your Gemini key in `.env.local`:
+3. Set your OpenAI-compatible LLM config in `.env`:
 
    ```env
-   GEMINI_API_KEY=your_api_key_here
+   LLM_API_KEY=your_api_key_here
+   LLM_BASE_URL=https://your-provider.example.com/v1
+   LLM_MODEL=your-model-name
    ```
 
 4. Start the development server:
@@ -82,35 +84,37 @@ The app combines a React frontend with an Express API layer that uses Gemini to:
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `GEMINI_API_KEY` | Yes | API key used for Gemini content generation |
+| `LLM_API_KEY` | Yes | API key used for OpenAI-compatible chat completions |
+| `LLM_BASE_URL` | Yes | Base URL for the OpenAI-compatible provider |
+| `LLM_MODEL` | Yes | Model name or path sent to `/v1/chat/completions` |
 | `APP_URL` | No | Host URL for deployed environments that need self-references |
 
 ## How It Works
 
 1. A user enters a research prompt such as a target product or comparison request.
 2. The server prepares likely targets, competitors, and clarifying questions.
-3. The app assembles a multi-company report using either seed data, cached results, or Gemini-generated fallback analysis.
+3. The app assembles a multi-company report using either seed data, cached results, or LLM-generated fallback analysis.
 4. Users can refine the output with chat follow-ups and generate custom report modules.
 
 ## Notes on Data
 
 - The repository includes curated seed data for demo and fallback behavior.
-- For products not present in `data/seed.json`, the server generates synthetic analysis using Gemini.
+- For products not present in `data/seed.json`, the server generates synthetic analysis using the configured OpenAI-compatible endpoint.
 - Generated outputs are cached in `.cache/` during local development.
 
 ## Deployment
 
 A production deploy should:
 
-- provide `GEMINI_API_KEY` securely through environment variables
+- provide `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` securely through environment variables
 - run `npm run build`
 - serve the bundled app with `npm run start`
 
-The current server is configured to listen on port `3000`.
+The current server listens on `PORT` and defaults to `8080`, with `GET /health` available for runtime health checks.
 
 ## Release Checklist
 
-- Add a valid production Gemini API key
+- Add valid production `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` values
 - Run `npm run lint`
 - Run `npm run build`
 - Verify the main report flow, custom block generation, and print layout

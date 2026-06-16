@@ -5,6 +5,8 @@ coverage/
 .cache/
 .vite/
 *.tsbuildinfo
+aivoc.db
+aivoc.db-*
 
 .DS_Store
 Thumbs.db
@@ -21,3 +23,5 @@ pnpm-debug.log*
 .env.test.local
 .env.production.local
 !.env.example
+.agentbase/
+.greennode.json

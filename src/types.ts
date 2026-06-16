@@ -54,8 +54,73 @@ export interface CustomBlock {
   };
 }
 
+export interface ClarifyQuestion {
+  key: string;
+  type: "single_select" | "multi_select" | "text" | "boolean";
+  question: string;
+  choices: string[];
+  recommended: string | null;
+  allow_other: boolean;
+}
+
+export interface ClarifyStep {
+  step_id: string;
+  title: string;
+  question: ClarifyQuestion;
+}
+
+export interface ResolvedApp {
+  name: string;
+  playId: string | null;
+  appStoreId: string | null;
+  iconUrl: string | null;
+  verified: boolean;
+}
+
+export type ReportStatus = "pending" | "running" | "ready" | "error";
+
+export interface MarketView {
+  totalApps: number;
+  totalReviews: number;
+  sentimentBreakdown: {
+    pos: number;
+    neu: number;
+    neg: number;
+  };
+  topTopics: Array<{
+    topic: string;
+    count: number;
+  }>;
+}
+
+export interface UnderstandIntent {
+  subject: string;
+  market: string;
+  competitors: string[];
+  audience: string;
+  objective: string;
+  focus: string;
+  data_sources: string[];
+  filters: {
+    time_range: string;
+    sentiment: string;
+    keywords: string[];
+  };
+}
+
+export interface SetupState {
+  sessionId: string | null;
+  currentStep: number;
+  reason: string | null;
+  steps: ClarifyStep[];
+  answers: Record<string, string | string[] | boolean>;
+  intent: UnderstandIntent | null;
+  apps: ResolvedApp[];
+  summary: string;
+}
+
 export interface AppState {
-  phase: "search" | "confirm" | "loading" | "report";
+  phase: "search" | "clarify" | "confirm" | "loading" | "report";
   query: string;
   companies: string[];
   activeBlocks: BlockId[];
@@ -65,6 +130,10 @@ export interface AppState {
   };
   chatHistory: ChatMessage[];
   customBlocks?: CustomBlock[];
+  setup?: SetupState;
+  reportId?: string | null;
+  reportStatus?: ReportStatus;
+  market?: MarketView | null;
 }
 
 export interface ClassificationAction {

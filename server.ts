@@ -1,290 +1,405 @@
 import express from "express";
 import path from "path";
-import fs from "fs";
-import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
+import analyzeRoutes from "./routes/analyze.ts";
+import reportsRoutes from "./routes/reports.ts";
+import { callChatCompletion, callJsonCompletion, stripCodeFences } from "./lib/llm.ts";
+import { resolveApp } from "./lib/crawler/resolveApp.ts";
+import { createReport } from "./lib/db/index.ts";
+import { runReport } from "./lib/crawler/runReport.ts";
+import { nowUnix } from "./lib/crawler/util.ts";
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-const PORT = 3000;
-const CACHE_DIR = path.join(process.cwd(), ".cache");
-if (!fs.existsSync(CACHE_DIR)) {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
+const PORT = Number(process.env.PORT || 8080);
+
+type ChatMessage = {
+  role: "system" | "user" | "assistant";
+  content: string;
+};
+
+type UnderstandAnswerValue = string | string[] | boolean | null;
+
+type ClarifyQuestion = {
+  key: string;
+  type: "single_select" | "multi_select" | "text" | "boolean";
+  question: string;
+  choices: string[];
+  recommended: string | null;
+  allow_other: boolean;
+};
+
+type ClarifyStep = {
+  step_id: string;
+  title: string;
+  question: ClarifyQuestion;
+};
+
+type UnderstoodIntent = {
+  subject: string;
+  market: string;
+  competitors: string[];
+  audience: string;
+  objective: string;
+  focus: string;
+  data_sources: string[];
+  filters: {
+    time_range: string;
+    sentiment: string;
+    keywords: string[];
+  };
+};
+
+type ResolvedApp = {
+  name: string;
+  playId: string | null;
+  appStoreId: string | null;
+  iconUrl: string | null;
+  verified: boolean;
+};
+
+type UnderstandSession = {
+  query: string;
+  answers: Record<string, UnderstandAnswerValue>;
+};
+
+function debugLog(label: string, payload?: unknown) {
+  if (payload === undefined) {
+    console.log(`[voc-debug] ${label}`);
+    return;
+  }
+  console.log(`[voc-debug] ${label}`, payload);
 }
 
-// Initialize Gemini Client
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY || "dummy-key",
-  httpOptions: {
-    headers: {
-      "User-Agent": "aistudio-build",
-    },
-  },
+app.get("/health", (_req, res) => {
+  res.status(200).json({ ok: true });
 });
 
-// Load seed data safely
-const SEED_PATH = path.join(process.cwd(), "data", "seed.json");
-let seedData: any = {};
-if (fs.existsSync(SEED_PATH)) {
-  try {
-    seedData = JSON.parse(fs.readFileSync(SEED_PATH, "utf-8"));
-  } catch (err) {
-    console.error("Error reading seed data:", err);
+const understandSessions = new Map<string, UnderstandSession>();
+
+const STEP_TITLES: Record<string, string> = {
+  role: "Your Role",
+  subject: "Target Product",
+  focus: "Research Focus",
+  objective: "Objective",
+  competitors: "Competitors",
+  market: "Market",
+  time_range: "Time Range",
+  data_sources: "Sources",
+  sentiment: "Sentiment",
+  keywords: "Keywords",
+};
+
+const QUESTION_KEY_ALIASES: Record<string, string> = {
+  "filters.time_range": "time_range",
+  "filters.sentiment": "sentiment",
+  "filters.keywords": "keywords",
+};
+
+const SOURCE_LABELS: Record<string, string> = {
+  app_store: "App Store",
+  google_play: "Google Play",
+  youtube: "YouTube",
+  tinhte: "Tinhte",
+  voz: "Voz",
+  reddit: "Reddit",
+};
+
+function createSessionId() {
+  return `understand-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function dedupeStrings(values: unknown[]) {
+  const out: string[] = [];
+  values.forEach((value) => {
+    if (typeof value !== "string") {
+      return;
+    }
+    const trimmed = value.trim();
+    if (!trimmed || out.includes(trimmed)) {
+      return;
+    }
+    out.push(trimmed);
+  });
+  return out;
+}
+
+function normalizeQuestionKey(value: unknown) {
+  if (typeof value !== "string") {
+    return "unknown";
   }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "unknown";
+  }
+  return QUESTION_KEY_ALIASES[trimmed] ?? trimmed;
 }
 
-// Clean target name for lookup
-function cleanName(n: string) {
-  return n.trim().toLowerCase();
+function humanizeStepTitle(key: string) {
+  const canonical = normalizeQuestionKey(key);
+  if (STEP_TITLES[canonical]) {
+    return STEP_TITLES[canonical];
+  }
+  return canonical
+    .split(".")
+    .pop()
+    ?.split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ") || canonical;
 }
 
-// Programmatic search & scraping pipeline with fallback
-async function scrapeAndAnalyzeCompany(companyName: string, focusArea?: string): Promise<any> {
-  const targetKey = Object.keys(seedData).find(
-    (key) => cleanName(key) === cleanName(companyName)
+function normalizeQuestion(raw: any): ClarifyQuestion {
+  const key = normalizeQuestionKey(
+    typeof raw?.key === "string" ? raw.key : typeof raw?.id === "string" ? raw.id.replace(/^q_/, "") : "unknown"
+  );
+  const rawChoices = Array.isArray(raw?.choices) ? raw.choices.filter((choice: unknown) => typeof choice === "string") : [];
+  const choices = rawChoices
+    .map((choice: string) => choice.trim())
+    .filter((choice: string) => choice && !/^other\b/i.test(choice) && !/^suggest another\b/i.test(choice))
+    .slice(0, 3);
+  const inferredType =
+    raw?.type === "multi_select" || key === "competitors"
+      ? "multi_select"
+      : raw?.type === "boolean"
+      ? "boolean"
+      : raw?.type === "single_select"
+      ? "single_select"
+      : raw?.type === "text"
+      ? "text"
+      : choices.length > 0
+      ? "single_select"
+      : "text";
+
+  return {
+    key,
+    type: inferredType,
+    question: typeof raw?.question === "string" && raw.question.trim() ? raw.question.trim() : `Please clarify ${key}.`,
+    choices,
+    recommended: typeof raw?.recommended === "string" && raw.recommended.trim() ? raw.recommended.trim() : choices[0] ?? null,
+    allow_other: raw?.allow_other !== false,
+  };
+}
+
+function stepsFromQuestions(questions: any[]): ClarifyStep[] {
+  return questions
+    .map((question) => normalizeQuestion(question))
+    .filter((question) => question.key && question.key !== "unknown")
+    .map((question) => ({
+      step_id: question.key,
+      title: humanizeStepTitle(question.key),
+      question,
+    }));
+}
+
+function buildLegacyClarifyPayload(query: string, parsed: any) {
+  const suggestedQuestions = Array.isArray(parsed?.suggestedQuestions) ? parsed.suggestedQuestions : [];
+  const steps = stepsFromQuestions(
+    suggestedQuestions.map((question: any) => ({
+      ...question,
+      key:
+        typeof question?.key === "string"
+          ? question.key
+          : typeof question?.id === "string"
+          ? question.id.replace(/^q_/, "")
+          : undefined,
+    }))
   );
 
-  const cacheFile = path.join(CACHE_DIR, `${cleanName(companyName)}.json`);
-
-  // If focusArea is specified, bypass cache to generate a custom-tailored analysis
-  if (!focusArea) {
-    // Fallback 1: Seed data matches
-    if (targetKey) {
-      return seedData[targetKey];
-    }
-
-    // Fallback 2: Cached data matches
-    if (fs.existsSync(cacheFile)) {
-      try {
-        return JSON.parse(fs.readFileSync(cacheFile, "utf-8"));
-      } catch {
-        // ignore and generate
-      }
-    }
+  if (!steps.find((step) => step.step_id === "subject")) {
+    steps.unshift({
+      step_id: "subject",
+      title: STEP_TITLES.subject,
+      question: {
+        key: "subject",
+        type: "text",
+        question: "Which company or product do you want to research?",
+        choices: [],
+        recommended: typeof parsed?.primaryProduct === "string" ? parsed.primaryProduct : query,
+        allow_other: true,
+      },
+    });
   }
 
-  // Fallback 3: Live generation with Gemini representation
-  console.log(`Generating synthetic live scrape analysis for: ${companyName}, focus area: ${focusArea || 'none'}`);
-  try {
-    let prompt = `Perform a comprehensive, realistic product sentiment and app store scrape analysis for the app or product: "${companyName}".
-Please generate detailed metric evaluations representing public feed/reviews from iOS App Store and Play Store.
-Include realistic topic distributions, insights featuring real patterns, and PO/QA/Marketing actionable items. 
-Make sure the rating, metrics list, and trend details make complete sense for this type of product.`;
+  return {
+    response_type: "CLARIFICATION_REQUIRED",
+    payload: {
+      suggestedQuestions: steps.map((step) => step.question),
+    },
+  };
+}
 
-    if (focusArea) {
-      prompt += `\n\nCRITICAL USER DIRECTIVE: The user has set the specific review analysis focus to: "${focusArea}". Please construct the insights, complaint topic percentages, and actionable PO/QA/Marketing items to directly address, analyze, and reflect patterns concerning "${focusArea}". Make it highly specific and actionable.`;
+function normalizeIntent(raw: any): UnderstoodIntent {
+  const filters = raw?.filters && typeof raw.filters === "object" ? raw.filters : {};
+  return {
+    subject: typeof raw?.subject === "string" ? raw.subject : "",
+    market: typeof raw?.market === "string" && raw.market.trim() ? raw.market : "Vietnam",
+    competitors: dedupeStrings(Array.isArray(raw?.competitors) ? raw.competitors : []),
+    audience: typeof raw?.audience === "string" ? raw.audience : "",
+    objective: typeof raw?.objective === "string" ? raw.objective : "",
+    focus: typeof raw?.focus === "string" ? raw.focus : "",
+    data_sources: dedupeStrings(Array.isArray(raw?.data_sources) ? raw.data_sources : []),
+    filters: {
+      time_range: typeof filters?.time_range === "string" ? filters.time_range : "last_90_days",
+      sentiment: typeof filters?.sentiment === "string" ? filters.sentiment : "all",
+      keywords: dedupeStrings(Array.isArray(filters?.keywords) ? filters.keywords : []),
+    },
+  };
+}
+
+function buildUnderstandPrompt(query: string, answers: Record<string, UnderstandAnswerValue>) {
+  const answerLines = Object.entries(answers).map(([key, value]) => {
+    if (Array.isArray(value)) {
+      return `${key}: ${value.join(", ")}`;
     }
+    if (typeof value === "boolean") {
+      return `${key}: ${value ? "yes" : "no"}`;
+    }
+    return `${key}: ${value ?? ""}`;
+  });
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            rating: { type: Type.NUMBER, description: "Average app rating from 1.0 to 5.0" },
-            reviewCount: { type: Type.INTEGER, description: "Total review count, e.g. 1200" },
-            sentimentBreakdown: {
-              type: Type.OBJECT,
-              properties: {
-                pos: { type: Type.INTEGER, description: "Percentage of positive reviews (0-100)" },
-                neu: { type: Type.INTEGER, description: "Percentage of neutral reviews (0-100)" },
-                neg: { type: Type.INTEGER, description: "Percentage of negative reviews (0-100)" }
-              },
-              required: ["pos", "neu", "neg"]
-            },
-            topicCounts: {
-              type: Type.OBJECT,
-              properties: {
-                Login: { type: Type.INTEGER },
-                Payment: { type: Type.INTEGER },
-                UI: { type: Type.INTEGER },
-                Performance: { type: Type.INTEGER },
-                Promo: { type: Type.INTEGER }
-              },
-              required: ["Login", "Payment", "UI", "Performance", "Promo"]
-            },
-            trendData: {
-              type: Type.ARRAY,
-              items: { type: Type.INTEGER },
-              description: "Exactly 30 daily negative sentiment percentages (ranging standard between 10 to 50)"
-            },
-            insights: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  topic: { type: Type.STRING },
-                  severity: { type: Type.STRING, description: "one of 'high', 'medium', or 'low'" },
-                  text: { type: Type.STRING, description: "Detailed 1-2 sentence market research insight based on reviewer feedback" }
-                },
-                required: ["topic", "severity", "text"]
-              }
-            },
-            actions: {
-              type: Type.OBJECT,
-              properties: {
-                PO: { type: Type.ARRAY, items: { type: Type.STRING }, description: "2 actionable items for Product Owner" },
-                QA: { type: Type.ARRAY, items: { type: Type.STRING }, description: "2 actionable items for QA Engineers" },
-                Marketing: { type: Type.ARRAY, items: { type: Type.STRING }, description: "2 actionable items for Marketing team" }
-              },
-              required: ["PO", "QA", "Marketing"]
-            }
-          },
-          required: ["rating", "reviewCount", "sentimentBreakdown", "topicCounts", "trendData", "insights", "actions"]
-        }
-      }
+  return [
+    `New VoC research request: "${query}".`,
+    "Use the reasoning-and-understanding skill.",
+    "Return JSON only.",
+    answerLines.length > 0 ? `Known answers:\n${answerLines.join("\n")}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+async function resolveAndVerifyApp(name: string, fromAgent?: any): Promise<ResolvedApp> {
+  const resolved = await resolveApp(name);
+  return {
+    name: resolved.name,
+    playId: resolved.playId ?? (typeof fromAgent?.playId === "string" ? fromAgent.playId : null),
+    appStoreId: resolved.appStoreId ?? (typeof fromAgent?.appStoreId === "string" ? fromAgent.appStoreId : null),
+    iconUrl: resolved.iconUrl ?? (typeof fromAgent?.iconUrl === "string" ? fromAgent.iconUrl : null),
+    verified: resolved.verified || Boolean(fromAgent?.playId || fromAgent?.appStoreId),
+  };
+}
+
+async function handleUnderstand(req: express.Request, res: express.Response) {
+  const { query, answers, session_id } = req.body || {};
+  const incomingAnswers =
+    answers && typeof answers === "object" && !Array.isArray(answers)
+      ? (answers as Record<string, UnderstandAnswerValue>)
+      : {};
+
+  let sessionId = typeof session_id === "string" && session_id.trim() ? session_id : createSessionId();
+  const previous = understandSessions.get(sessionId);
+  const sessionQuery =
+    typeof query === "string" && query.trim()
+      ? query.trim()
+      : previous?.query?.trim()
+      ? previous.query.trim()
+      : "";
+
+  if (!sessionQuery) {
+    return res.status(400).json({ phase: "error", message: "Query is required" });
+  }
+
+  const mergedAnswers = { ...(previous?.answers ?? {}), ...incomingAnswers };
+  understandSessions.set(sessionId, { query: sessionQuery, answers: mergedAnswers });
+
+  try {
+    const content = buildUnderstandPrompt(sessionQuery, mergedAnswers);
+    debugLog("understand:start", {
+      sessionId,
+      query: sessionQuery,
+      answers: mergedAnswers,
     });
 
-    const parsedData = JSON.parse(response.text || "{}");
-    // Ensure negative, positive and neutral sum to 100
-    const sum = (parsedData.sentimentBreakdown?.pos || 0) + (parsedData.sentimentBreakdown?.neu || 0) + (parsedData.sentimentBreakdown?.neg || 0);
-    if (sum !== 100 && parsedData.sentimentBreakdown) {
-      parsedData.sentimentBreakdown.pos = 100 - parsedData.sentimentBreakdown.neu - parsedData.sentimentBreakdown.neg;
+    const completion = await callChatCompletion(
+      [
+        {
+          role: "user",
+          content,
+        },
+      ],
+      {
+        user: sessionId,
+      }
+    );
+
+    debugLog("understand:raw_completion", completion.text);
+
+    const parsed = JSON.parse(stripCodeFences(completion.text) || "{}");
+    const envelope =
+      parsed?.response_type && parsed?.payload
+        ? parsed
+        : Array.isArray(parsed?.suggestedQuestions)
+        ? buildLegacyClarifyPayload(sessionQuery, parsed)
+        : null;
+
+    if (!envelope) {
+      return res.status(502).json({
+        phase: "error",
+        message: "Task-understanding returned an unexpected response.",
+      });
     }
 
-    // Cache the result if there is no custom focusArea
-    if (!focusArea) {
-      fs.writeFileSync(cacheFile, JSON.stringify(parsedData, null, 2), "utf-8");
+    if (envelope.response_type === "CLARIFICATION_REQUIRED") {
+      const steps = stepsFromQuestions(envelope?.payload?.suggestedQuestions ?? []);
+      return res.json({
+        phase: "clarify",
+        session_id: sessionId,
+        reason: typeof envelope?.payload?.reason === "string" ? envelope.payload.reason : null,
+        steps,
+      });
     }
-    return parsedData;
-  } catch (error) {
-    console.error("Gemini live scrape generation failed:", error);
-    // Absolute fallback: pick random seed or generate default structure
-    const randomKey = Object.keys(seedData)[0] || "MoMo";
-    return seedData[randomKey];
+
+    if (envelope.response_type === "PLAN_CONFIRMATION") {
+      const intent = normalizeIntent(envelope?.payload?.intent);
+      const uniqueNames = dedupeStrings([intent.subject, ...(intent.competitors ?? [])]);
+      const resolvedFromAgent = Array.isArray(envelope?.payload?.resolved_apps) ? envelope.payload.resolved_apps : [];
+      const apps = (
+        await Promise.all(
+          uniqueNames.map((name) =>
+            resolveAndVerifyApp(
+              name,
+              resolvedFromAgent.find((app: any) => typeof app?.name === "string" && app.name.toLowerCase() === name.toLowerCase())
+            )
+          )
+        )
+      ).filter((app) => app.verified);
+
+      return res.json({
+        phase: "confirm",
+        session_id: sessionId,
+        intent,
+        apps,
+        summary: typeof envelope?.payload?.plan?.summary === "string" ? envelope.payload.plan.summary : "",
+      });
+    }
+
+    if (envelope.response_type === "ERROR") {
+      return res.status(400).json({
+        phase: "error",
+        message: envelope?.error?.message || "Task-understanding failed.",
+      });
+    }
+
+    return res.status(502).json({
+      phase: "error",
+      message: "Task-understanding returned an unsupported envelope.",
+    });
+  } catch (error: any) {
+    console.error("[voc-debug] understand failed:", error);
+    return res.status(502).json({
+      phase: "error",
+      message: "Task-understanding request failed.",
+      details: error?.message || "Unknown upstream error",
+    });
   }
 }
 
-// 1. API: Prepare Confirmation Parameters (Human-in-the-loop)
-app.post("/api/prepare_confirmation", async (req, res) => {
-  const { query } = req.body;
-  if (!query) {
-    return res.status(400).json({ error: "Query is required" });
-  }
-
-  try {
-    const prompt = `You are an elite product research analyst assistant. The user wants to perform reviews and sentiment analysis based on this query: "${query}".
-Extract and recommend:
-1. The most probable main target product, application, or company name mentioned (capitalized nicely).
-2. A list of 1 to 2 logical direct competitor brands in the same category or region for baseline benchmarking.
-3. Exactly two (2) smart, custom, contextual clarification questions that help the user refine and specify their analysis priorities. (For example, asking which specific features to check or what their primary analytical objective is). Include 3 logical choices for each question, and keep choices concise, readable, and highly helpful.
-
-Return standard JSON output strictly matching the requested format.`;
-
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            primaryProduct: { 
-              type: Type.STRING, 
-              description: "Extracted nicely formatted main company/app name" 
-            },
-            suggestedCompetitors: { 
-              type: Type.ARRAY, 
-              items: { type: Type.STRING }, 
-              description: "1 to 2 direct competitors" 
-            },
-            suggestedQuestions: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING },
-                  question: { type: Type.STRING },
-                  choices: { type: Type.ARRAY, items: { type: Type.STRING } }
-                },
-                required: ["id", "question", "choices"]
-              },
-              description: "Exactly two custom feedback-tuning questions"
-            }
-          },
-          required: ["primaryProduct", "suggestedCompetitors", "suggestedQuestions"]
-        }
-      }
-    });
-
-    const parsed = JSON.parse(response.text || "{}");
-    res.json(parsed);
-  } catch (error: any) {
-    console.error("prepare_confirmation failed, returning fallback:", error);
-    res.json({
-      primaryProduct: query.substring(0, 30),
-      suggestedCompetitors: ["MoMo", "VNPay"],
-      suggestedQuestions: [
-        {
-          id: "q_focus",
-          question: "Which topic is your prime focus for this review exploration?",
-          choices: ["Transaction failures & speed", "UI/UX & usability issues", "Rewards & promo satisfaction"]
-        },
-        {
-          id: "q_scope",
-          question: "What is your primary analytical objective?",
-          choices: ["QA debugging & bug sweeps", "Direct competitor feature gap benchmark", "Product roadmap design"]
-        }
-      ]
-    });
-  }
-});
-
-// 1.5. API: Process App Lookup / Analyze Request
-app.post("/api/analyze", async (req, res) => {
-  const { query, companies = [], focusArea } = req.body;
-  if (!query && companies.length === 0) {
-    return res.status(400).json({ error: "Query or companies list is required" });
-  }
-
-  try {
-    let resultCompanies: string[] = [];
-    let targetCompany = "";
-
-    if (Array.isArray(companies) && companies.length > 0) {
-      resultCompanies = Array.from(new Set(companies)) as string[];
-      targetCompany = resultCompanies[0];
-    } else {
-      // Fallback
-      targetCompany = query.trim();
-      if (query.length > 3) {
-        try {
-          const parseRes = await ai.models.generateContent({
-            model: "gemini-3.5-flash",
-            contents: `Extract the single main application or company name mentioned in this market query: "${query}". Return ONLY the company name (e.g. "ShopeePay" or "VNPay"), capitalized nicely. Do not write any other letters. If no app name is found, return the query itself.`,
-          });
-          const extracted = parseRes.text?.trim();
-          if (extracted && extracted.length > 0 && extracted.length < 30) {
-            targetCompany = extracted;
-          }
-        } catch {
-          // ignore
-        }
-      }
-      resultCompanies = [targetCompany];
-    }
-
-    // Always fetch target company
-    const responseData: { [name: string]: any } = {};
-    for (const c of resultCompanies) {
-      responseData[c] = await scrapeAndAnalyzeCompany(c, focusArea);
-    }
-
-    res.json({
-      targetCompany,
-      companies: resultCompanies,
-      data: responseData
-    });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message || "Pipeline error" });
-  }
-});
+app.post("/api/understand", handleUnderstand);
+app.post("/api/prepare_confirmation", handleUnderstand);
 
 // 2. API: Classify user instructions and fetch answers or block mutations
 app.post("/api/classify", async (req, res) => {
@@ -300,11 +415,10 @@ Current active reports summarized text: ${summaryText}
 Classify the user intent into one or more actions (ASK, ADD_BLOCK, REMOVE_BLOCK, ADD_COMPANY, REMOVE_COMPANY, FILTER, ADD_CUSTOM_BLOCK).
 Return a JSON array of actions as specified.`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        systemInstruction: `You are an intent classifier and expert fintech product researcher for a market review analytics dashboard.
+    const actions = await callJsonCompletion([
+      {
+        role: "system",
+        content: `You are an intent classifier and expert fintech product researcher for a market review analytics dashboard.
 Given the user's message, classify the user intent into a list of actions.
 Supported action types:
   - ASK: For informational questions or follow-ups. You MUST return payload.answer (analytical 2-3 sentence summary) and payload.citations (array of 2-3 specific simulated review items with "source" and "text" reflecting user complaints on active products). If the question mentions specific complaints like "refund" or "login", search the context and provide realistic matched citations like "[Google Play Review]" or "[App Store Review]".
@@ -314,53 +428,48 @@ Supported action types:
   - ADD_BLOCK or REMOVE_BLOCK: To toggle native blocks. Available block IDs: metrics, insights, sentiment_pie, topic_bar, trend, actions
   - FILTER: Set filter values. filter_key is "sentiment" or "dateRange".
 
-Return only valid JSON matching the schema. No markdown wrapping.`,
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              type: { type: Type.STRING, description: "Must be: ASK, ADD_BLOCK, REMOVE_BLOCK, ADD_COMPANY, REMOVE_COMPANY, FILTER, or ADD_CUSTOM_BLOCK" },
-              payload: {
-                type: Type.OBJECT,
-                properties: {
-                  block_id: { type: Type.STRING, description: "One of: metrics, insights, sentiment_pie, topic_bar, trend, actions" },
-                  company_name: { type: Type.STRING, description: "Company string to add/remove" },
-                  filter_key: { type: Type.STRING, description: "One of: sentiment, dateRange, sources" },
-                  filter_value: { type: Type.STRING, description: "Target value (e.g. positive, negative, 7d, 30d, etc.)" },
-                  answer: { type: Type.STRING, description: "Polished 2-3 sentence answer specifically responding to the user's question, citing rates, counts or complaints from the active context." },
-                  custom_block_title: { type: Type.STRING, description: "Title of the custom dashboard block requested" },
-                  custom_block_prompt: { type: Type.STRING, description: "Detailed directive prompts to run the custom block generator" },
-                  citations: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        source: { type: Type.STRING, description: "E.g. iOS App Store #421 or Play Store Review (Aug 2024)" },
-                        text: { type: Type.STRING, description: "Detailed 1-sentence raw user review snippet with dates and relevant complaints matching the query topic" }
-                      },
-                      required: ["source", "text"]
-                    },
-                    description: "List of 2 to 3 detailed citations mapping to raw user reviews corroborating this answer"
-                  }
-                }
-              }
-            },
-            required: ["type", "payload"]
-          }
-        }
-      }
-    });
-
-    const actions = JSON.parse(response.text || "[]");
+Return only valid JSON matching this shape with no markdown:
+[
+  {
+    "type": "ASK" | "ADD_BLOCK" | "REMOVE_BLOCK" | "ADD_COMPANY" | "REMOVE_COMPANY" | "FILTER" | "ADD_CUSTOM_BLOCK",
+    "payload": {
+      "block_id"?: string,
+      "company_name"?: string,
+      "filter_key"?: string,
+      "filter_value"?: string,
+      "answer"?: string,
+      "custom_block_title"?: string,
+      "custom_block_prompt"?: string,
+      "citations"?: [{ "source": string, "text": string }]
+    }
+  }
+]`,
+      },
+      {
+        role: "user",
+        content: prompt,
+      },
+    ]) as any[];
 
     // For any ADD_COMPANY actions, we pre-fetch the data first so the client can receive it directly!
     const updatedData: { [name: string]: any } = {};
     for (const action of actions) {
       if (action.type === "ADD_COMPANY" && action.payload?.company_name) {
         const cName = action.payload.company_name;
-        updatedData[cName] = await scrapeAndAnalyzeCompany(cName);
+        const reportId = `adhoc-${cName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${Date.now()}`;
+        await createReport({
+          id: reportId,
+          apps: [cName],
+          goal: "adhoc_compare",
+          focus_area: null,
+          status: "pending",
+          created_at: nowUnix(),
+          company_data: { data: {}, market: null },
+        });
+        const result = await runReport(reportId, [cName], "adhoc_compare", undefined, 90);
+        if (result.data[cName]) {
+          updatedData[cName] = result.data[cName];
+        }
       }
     }
 
@@ -394,50 +503,34 @@ For each compared product, generate:
 
 Make sure the information is highly realistic and tailored specifically to the compared products. Ensure complete JSON response.`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: aiPrompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            title: { type: Type.STRING },
-            data: {
-              type: Type.OBJECT,
-              description: "Map of company names to their custom analysis data details",
-              properties: companies.reduce((acc, company) => {
-                acc[company] = {
-                  type: Type.OBJECT,
-                  properties: {
-                    rating: { type: Type.NUMBER, description: "Category rating from 1.0 to 5.0" },
-                    severity: { type: Type.STRING, description: "Must be: high, medium, or low" },
-                    summary: { type: Type.STRING, description: "1-2 sentence professional executive summary of feedback" },
-                    points: {
-                      type: Type.ARRAY,
-                      items: { type: Type.STRING },
-                      description: "Exactly 2 bullet points of detailed findings"
-                    }
-                  },
-                  required: ["rating", "severity", "summary", "points"]
-                };
-                return acc;
-              }, {} as any),
-              required: companies
-            }
-          },
-          required: ["title", "data"]
-        }
-      }
-    });
+    const parsed = await callJsonCompletion([
+      {
+        role: "system",
+        content:
+          "You generate realistic dashboard comparison blocks. Return valid JSON only with keys title and data.",
+      },
+      {
+        role: "user",
+        content: `${aiPrompt}
 
-    const parsed = JSON.parse(response.text || "{}");
+Return strict JSON:
+{
+  "title": string,
+  "data": {
+    ${companies.map((company) => `"${company}": { "rating": number, "severity": "high" | "medium" | "low", "summary": string, "points": [string, string] }`).join(",\n    ")}
+  }
+}`,
+      },
+    ]);
     res.json(parsed);
   } catch (error: any) {
     console.error("Custom block generation failed:", error);
     res.status(500).json({ error: error.message || "Failed to generate custom AI block" });
   }
 });
+
+app.use(analyzeRoutes);
+app.use(reportsRoutes);
 
 // Vite Middleware Setup or Production Serving
 async function startServer() {
@@ -450,7 +543,7 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*all", (req, res) => {
+    app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
