@@ -29,7 +29,12 @@ export interface ChatMessage {
   role: "user" | "agent";
   text: string;
   timestamp: number;
-  citations?: { source: string; text: string }[];
+  citations?: {
+    source: string;
+    text: string;
+    app?: string;
+    source_url?: string;
+  }[];
 }
 
 // Allowed Block IDs
@@ -108,6 +113,55 @@ export interface UnderstandIntent {
   };
 }
 
+export interface ReportReview {
+  id: string;
+  app: string;
+  source: string;
+  author: string | null;
+  rating: number | null;
+  content: string;
+  published_at: number | null;
+  source_url: string;
+  topic: string | null;
+  sentiment: "positive" | "neutral" | "negative" | null;
+  confidence: number | null;
+}
+
+export interface ReportReference {
+  id: string;
+  topic: string | null;
+  rank: number | null;
+  app: string;
+  source: string;
+  content: string;
+  source_url: string;
+}
+
+export interface ReportSourcesStatus {
+  totalReviews: number;
+  sourceCount: number;
+  sources: string[];
+  latestPublishedAt: number | null;
+  appsCovered: number;
+}
+
+export type ReportBlock =
+  | { id: "evidence_kpis"; type: "evidence_kpis" }
+  | { id: "situation_overview"; type: "situation_overview" }
+  | { id: "topic_bar"; type: "topic_bar" }
+  | { id: "sentiment_split"; type: "sentiment_split" }
+  | { id: "actions"; type: "actions" }
+  | {
+      id: "next_threads";
+      type: "next_threads";
+      threads: Array<{
+        icon: string;
+        title: string;
+        note: string;
+        prompt: string;
+      }>;
+    };
+
 export interface SetupState {
   sessionId: string | null;
   currentStep: number;
@@ -134,6 +188,12 @@ export interface AppState {
   reportId?: string | null;
   reportStatus?: ReportStatus;
   market?: MarketView | null;
+  reportReviews?: ReportReview[];
+  reportReferences?: ReportReference[];
+  reportSourcesStatus?: ReportSourcesStatus | null;
+  isLoadingSources?: boolean;
+  briefMarkdown?: string;
+  reportBlocks?: ReportBlock[];
 }
 
 export interface ClassificationAction {

@@ -84,8 +84,20 @@ export const ReportChatPane: React.FC<ReportChatPaneProps> = ({
                         <div className="space-y-1">
                           {msg.citations.map((cite, cIdx) => (
                             <div key={cIdx} className="text-[10px] text-slate-600 bg-slate-50 border border-gray-100 p-2 rounded">
-                              <span className="font-bold text-blue-700 block mb-0.5">{cite.source}</span>
+                              <span className="font-bold text-blue-700 block mb-0.5">
+                                {cite.app ? `${cite.app} · ` : ""}{cite.source}
+                              </span>
                               <span className="italic">"{cite.text}"</span>
+                              {cite.source_url && (
+                                <a
+                                  href={cite.source_url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="block mt-1 text-[10px] font-semibold text-blue-600 hover:text-blue-700"
+                                >
+                                  Open source
+                                </a>
+                              )}
                             </div>
                           ))}
                         </div>

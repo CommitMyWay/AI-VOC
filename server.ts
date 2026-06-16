@@ -109,6 +109,15 @@ const SOURCE_LABELS: Record<string, string> = {
   reddit: "Reddit",
 };
 
+const SOURCE_KEYWORDS: Array<{ id: string; patterns: string[] }> = [
+  { id: "app_store", patterns: ["app store"] },
+  { id: "google_play", patterns: ["google play", "play store", "play reviews"] },
+  { id: "youtube", patterns: ["youtube"] },
+  { id: "tinhte", patterns: ["tinhte"] },
+  { id: "voz", patterns: ["voz"] },
+  { id: "reddit", patterns: ["reddit"] },
+];
+
 function createSessionId() {
   return `understand-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -251,6 +260,164 @@ function normalizeIntent(raw: any): UnderstoodIntent {
   };
 }
 
+function unwrapArbitraryAgentPayload(raw: any): any {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return raw;
+  }
+
+  const values = Object.values(raw).filter((value) => value && typeof value === "object" && !Array.isArray(value));
+  if (values.length === 1) {
+    return values[0];
+  }
+  return raw;
+}
+
+function coerceSourceIds(values: unknown[]) {
+  const found = new Set<string>();
+  values.forEach((value) => {
+    if (typeof value !== "string") {
+      return;
+    }
+    const normalized = value.toLowerCase();
+    SOURCE_KEYWORDS.forEach((source) => {
+      if (source.patterns.some((pattern) => normalized.includes(pattern))) {
+        found.add(source.id);
+      }
+    });
+  });
+  return Array.from(found);
+}
+
+function extractFallbackIntent(raw: any, query: string, answers: Record<string, UnderstandAnswerValue>): UnderstoodIntent {
+  const payload = unwrapArbitraryAgentPayload(raw) || {};
+  const methodology = payload?.methodology && typeof payload.methodology === "object" ? payload.methodology : {};
+  const context = payload?.context && typeof payload.context === "object" ? payload.context : {};
+  const scope = payload?.benchmarking_scope && typeof payload.benchmarking_scope === "object" ? payload.benchmarking_scope : {};
+  const rawSources = [
+    ...(Array.isArray(payload?.data_sources) ? payload.data_sources : []),
+    ...(Array.isArray(methodology?.data_sources) ? methodology.data_sources : []),
+    ...(Array.isArray(payload?.simulated_data_sources) ? payload.simulated_data_sources : []),
+    ...(Array.isArray(answers?.data_sources) ? answers.data_sources : []),
+  ];
+  const inferredSources = coerceSourceIds(rawSources);
+  const competitors = dedupeStrings([
+    ...(Array.isArray(scope?.competitors) ? scope.competitors : []),
+    ...(Array.isArray(payload?.competitors) ? payload.competitors : []),
+    ...(Array.isArray(answers?.competitors) ? answers.competitors : []),
+  ]);
+
+  const explicitSubject = typeof answers?.subject === "string" && answers.subject.trim() ? answers.subject.trim() : null;
+  const payloadSubject =
+    (typeof payload?.subject === "string" && payload.subject.trim()) ||
+    (typeof context?.target_product === "string" && context.target_product.trim()) ||
+    (typeof payload?.target_product === "string" && payload.target_product.trim()) ||
+    query;
+
+  return {
+    subject: explicitSubject || payloadSubject || query,
+    market:
+      (typeof answers?.market === "string" && answers.market.trim()) ||
+      (typeof context?.industry === "string" && context.industry.trim()) ||
+      "Vietnam",
+    competitors,
+    audience:
+      (typeof answers?.role === "string" && answers.role.trim()) ||
+      (typeof payload?.audience === "string" && payload.audience.trim()) ||
+      "Product team",
+    objective:
+      (typeof answers?.objective === "string" && answers.objective.trim()) ||
+      (typeof payload?.primary_objective === "string" && payload.primary_objective.trim()) ||
+      query,
+    focus:
+      (typeof answers?.focus === "string" && answers.focus.trim()) ||
+      (Array.isArray(payload?.key_focus_areas) ? dedupeStrings(payload.key_focus_areas).slice(0, 3).join(", ") : "") ||
+      (Array.isArray(payload?.key_investigation_areas)
+        ? dedupeStrings(payload.key_investigation_areas.map((item: any) => item?.product_domain).filter(Boolean)).slice(0, 3).join(", ")
+        : ""),
+    data_sources: inferredSources.length > 0 ? inferredSources : ["app_store", "google_play"],
+    filters: {
+      time_range: typeof answers?.time_range === "string" && answers.time_range.trim() ? answers.time_range : "last_90_days",
+      sentiment: typeof answers?.sentiment === "string" && answers.sentiment.trim() ? answers.sentiment : "all",
+      keywords: dedupeStrings(Array.isArray(answers?.keywords) ? answers.keywords : []),
+    },
+  };
+}
+
+function buildFallbackClarifyEnvelope(query: string, raw: any) {
+  const intent = extractFallbackIntent(raw, query, {});
+  return {
+    response_type: "CLARIFICATION_REQUIRED",
+    payload: {
+      reason: "I want to lock the research setup before generating the report.",
+      suggestedQuestions: [
+        {
+          key: "subject",
+          type: "text",
+          question: "Which app or company should we analyze first?",
+          choices: [],
+          recommended: intent.subject || query,
+          allow_other: true,
+        },
+        {
+          key: "role",
+          type: "single_select",
+          question: "Who is the main audience for this report?",
+          choices: ["Product Manager", "QA Lead", "Marketing Lead"],
+          recommended: "Product Manager",
+          allow_other: true,
+        },
+        {
+          key: "focus",
+          type: "single_select",
+          question: "What should we focus on first?",
+          choices: ["General", "Payments", "Login"],
+          recommended: "General",
+          allow_other: true,
+        },
+        {
+          key: "competitors",
+          type: "multi_select",
+          question: "Which competitors should we compare against?",
+          choices: intent.competitors.slice(0, 3),
+          recommended: intent.competitors[0] ?? null,
+          allow_other: true,
+        },
+        {
+          key: "time_range",
+          type: "single_select",
+          question: "Which review window should we analyze?",
+          choices: ["last_30_days", "last_90_days", "last_7_days"],
+          recommended: "last_90_days",
+          allow_other: false,
+        },
+        {
+          key: "data_sources",
+          type: "multi_select",
+          question: "Which sources should we prioritize?",
+          choices: ["google_play", "app_store", "youtube"],
+          recommended: "google_play",
+          allow_other: true,
+        },
+      ],
+    },
+  };
+}
+
+function buildFallbackConfirmEnvelope(query: string, raw: any, answers: Record<string, UnderstandAnswerValue>) {
+  const intent = extractFallbackIntent(raw, query, answers);
+  const resolvedApps = dedupeStrings([intent.subject, ...intent.competitors]).map((name) => ({ name }));
+  return {
+    response_type: "PLAN_CONFIRMATION",
+    payload: {
+      intent,
+      resolved_apps: resolvedApps,
+      plan: {
+        summary: `Analyze ${intent.subject} for ${intent.audience} with focus on ${intent.focus || "general feedback"} across ${intent.data_sources.map((id) => SOURCE_LABELS[id] || id).join(", ")}.`,
+      },
+    },
+  };
+}
+
 function buildUnderstandPrompt(query: string, answers: Record<string, UnderstandAnswerValue>) {
   const answerLines = Object.entries(answers).map(([key, value]) => {
     if (Array.isArray(value)) {
@@ -329,18 +496,16 @@ async function handleUnderstand(req: express.Request, res: express.Response) {
     debugLog("understand:raw_completion", completion.text);
 
     const parsed = JSON.parse(stripCodeFences(completion.text) || "{}");
-    const envelope =
-      parsed?.response_type && parsed?.payload
-        ? parsed
-        : Array.isArray(parsed?.suggestedQuestions)
-        ? buildLegacyClarifyPayload(sessionQuery, parsed)
-        : null;
-
-    if (!envelope) {
-      return res.status(502).json({
-        phase: "error",
-        message: "Task-understanding returned an unexpected response.",
-      });
+    const arbitraryPayload = unwrapArbitraryAgentPayload(parsed);
+    let envelope: any = null;
+    if (parsed?.response_type && parsed?.payload) {
+      envelope = parsed;
+    } else if (Array.isArray(parsed?.suggestedQuestions)) {
+      envelope = buildLegacyClarifyPayload(sessionQuery, parsed);
+    } else if (Object.keys(mergedAnswers).length === 0) {
+      envelope = buildFallbackClarifyEnvelope(sessionQuery, arbitraryPayload);
+    } else {
+      envelope = buildFallbackConfirmEnvelope(sessionQuery, arbitraryPayload, mergedAnswers);
     }
 
     if (envelope.response_type === "CLARIFICATION_REQUIRED") {
@@ -453,6 +618,7 @@ Return only valid JSON matching this shape with no markdown:
 
     // For any ADD_COMPANY actions, we pre-fetch the data first so the client can receive it directly!
     const updatedData: { [name: string]: any } = {};
+    const updatedReports: { [name: string]: string } = {};
     for (const action of actions) {
       if (action.type === "ADD_COMPANY" && action.payload?.company_name) {
         const cName = action.payload.company_name;
@@ -469,11 +635,12 @@ Return only valid JSON matching this shape with no markdown:
         const result = await runReport(reportId, [cName], "adhoc_compare", undefined, 90);
         if (result.data[cName]) {
           updatedData[cName] = result.data[cName];
+          updatedReports[cName] = reportId;
         }
       }
     }
 
-    res.json({ actions, updatedData });
+    res.json({ actions, updatedData, updatedReports });
   } catch (error: any) {
     console.error("Classifier error:", error);
     res.status(500).json({ error: error.message || "Classifier pipeline failed" });

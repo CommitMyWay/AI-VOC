@@ -71,3 +71,25 @@ export type MarketView = {
   };
   topTopics: TopicMetrics[];
 };
+
+export type ReportBlock =
+  | { id: "evidence_kpis"; type: "evidence_kpis" }
+  | { id: "situation_overview"; type: "situation_overview" }
+  | { id: "topic_bar"; type: "topic_bar" }
+  | { id: "sentiment_split"; type: "sentiment_split" }
+  | { id: "actions"; type: "actions" }
+  | {
+      id: "next_threads";
+      type: "next_threads";
+      threads: Array<{
+        icon: string;
+        title: string;
+        note: string;
+        prompt: string;
+      }>;
+    };
+
+export type ReportPresentation = {
+  brief_markdown: string;
+  blocks: ReportBlock[];
+};

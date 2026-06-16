@@ -28,7 +28,23 @@ import {
   ArrowLeft,
   ArrowRight
 } from "lucide-react";
-import { AppState, BlockId, CompanyData, ChatMessage, AppFilters, CustomBlock, SetupState, ClarifyStep, ResolvedApp, UnderstandIntent, ReportStatus } from "./types";
+import {
+  AppState,
+  BlockId,
+  CompanyData,
+  ChatMessage,
+  AppFilters,
+  CustomBlock,
+  SetupState,
+  ClarifyStep,
+  ResolvedApp,
+  UnderstandIntent,
+  ReportStatus,
+  ReportReview,
+  ReportReference,
+  ReportSourcesStatus,
+  ReportBlock,
+} from "./types";
 import { ReportBrief } from "./components/ReportBrief";
 import { ReportHeader } from "./components/ReportHeader";
 import { ReportChatPane } from "./components/ReportChatPane";
@@ -77,6 +93,47 @@ const SOURCE_LABELS: Record<string, string> = {
   reddit: "Reddit",
 };
 
+const REPORT_SOURCE_LABELS: Record<string, string> = {
+  app_store: "App Store",
+  google_play: "Google Play",
+  youtube: "YouTube",
+  tinhte: "Tinhte",
+  voz: "VOZ",
+  reddit: "Reddit",
+};
+
+function formatReportSource(source: string) {
+  return REPORT_SOURCE_LABELS[source] || source.replace(/_/g, " ");
+}
+
+function formatPublishedDate(unix: number | null) {
+  if (!unix) {
+    return "Undated";
+  }
+  return new Date(unix * 1000).toLocaleDateString("en-US", { month: "short", day: "2-digit", year: "numeric" });
+}
+
+function deriveReportSourcesStatus(reviews: ReportReview[], companies: string[]): ReportSourcesStatus {
+  const sourceSet = new Set(reviews.map((review) => formatReportSource(review.source)));
+  const latestPublishedAt = reviews.reduce<number | null>((latest, review) => {
+    if (!review.published_at) {
+      return latest;
+    }
+    if (!latest || review.published_at > latest) {
+      return review.published_at;
+    }
+    return latest;
+  }, null);
+
+  return {
+    totalReviews: reviews.length,
+    sourceCount: sourceSet.size,
+    sources: Array.from(sourceSet),
+    latestPublishedAt,
+    appsCovered: new Set(reviews.map((review) => review.app).filter(Boolean)).size || companies.length,
+  };
+}
+
 export default function App() {
   // State Initialization from LocalStorage
   const [state, setState] = useState<AppState>(() => {
@@ -109,6 +166,12 @@ export default function App() {
       reportId: null,
       reportStatus: undefined,
       market: null,
+      reportReviews: [],
+      reportReferences: [],
+      reportSourcesStatus: null,
+      isLoadingSources: false,
+      briefMarkdown: "",
+      reportBlocks: [],
     };
   });
 
@@ -183,45 +246,35 @@ export default function App() {
     return typeof value === "string" && value.trim().length > 0;
   };
 
-  const getCrawlLogsForCompanies = () => {
-    const list: { company: string; source: string; text: string; stars: number; date: string }[] = [];
-    state.companies.forEach((company) => {
-      const coLower = company.toLowerCase();
-      if (coLower.includes("vnpay")) {
-        list.push(
-          { company, source: "App Store Review #102", text: "Refunds for failed airline transaction took 4 business days. No status change inside the wallet.", stars: 2, date: "May 28, 2026" },
-          { company, source: "Google Play Review #445", text: "Great promotions for cinemas but OTP sometimes delayed when buying tickets.", stars: 3, date: "Jun 02, 2026" },
-          { company, source: "Google Play Review #12", text: "Super clean UI and secure login. My gold standard app.", stars: 5, date: "Jun 11, 2026" }
-        );
-      } else if (coLower.includes("momo")) {
-        list.push(
-          { company, source: "App Store Review #124", text: "MOMO is convenient, but the transaction fees for linked bank transfers grew too high.", stars: 3, date: "Jun 04, 2026" },
-          { company, source: "Google Play Review #682", text: "Stuck loading in the splash screens after the latest update on Android 14. Promptly resolved after reinstall.", stars: 2, date: "May 29, 2026" },
-          { company, source: "App Store Review #924", text: "Very robust bill payment reminders. Saves me time weekly.", stars: 5, date: "Jun 10, 2026" }
-        );
-      } else if (coLower.includes("zalopay")) {
-        list.push(
-          { company, source: "Google Play Review #33", text: "ZaloPay refund fails to credit back immediately if payment times out in partner sites.", stars: 1, date: "Jun 09, 2026" },
-          { company, source: "App Store Review #221", text: "Integration with Chat Zalo makes sending lucky money extremely smooth.", stars: 5, date: "Jun 12, 2026" },
-          { company, source: "Google Play Review #499", text: "Slow customer service when verifying transaction references. Chat agent took over an hour.", stars: 2, date: "Jun 01, 2026" }
-        );
-      } else {
-        list.push(
-          { company, source: "Google Play Review #728", text: `The latest upgrade of ${company} is laggy. Takes double taps to confirm.`, stars: 2, date: "Jun 03, 2026" },
-          { company, source: "App Store Review #14", text: `I hope ${company} simplifies the cash-in and cash-out verification flow soon.`, stars: 3, date: "Jun 08, 2026" },
-          { company, source: "Google Play Review #99", text: `Outstanding UX. Comparing to other wallets, ${company} is indeed faster.`, stars: 5, date: "Jun 11, 2026" }
-        );
-      }
-    });
-    return list;
-  };
-
   // Scroll to new chat elements automatically
   useEffect(() => {
     if (state.phase === "report") {
       bottomChatRef.current?.scrollIntoView({ behavior: "smooth" });
     }
   }, [state.chatHistory, state.phase]);
+
+  const fetchReportEvidence = async (reportId: string, companies: string[]) => {
+    const params = companies.map((company) => `companies=${encodeURIComponent(company)}`).join("&");
+    const querySuffix = params ? `?${params}` : "";
+    const [reviewsRes, referencesRes] = await Promise.all([
+      fetch(`/api/reports/${reportId}/reviews${querySuffix}`),
+      fetch(`/api/reports/${reportId}/references${querySuffix}`),
+    ]);
+
+    if (!reviewsRes.ok || !referencesRes.ok) {
+      throw new Error("Could not load report evidence.");
+    }
+
+    const reviewsBody = await reviewsRes.json();
+    const referencesBody = await referencesRes.json();
+    const reportReviews = Array.isArray(reviewsBody?.reviews) ? (reviewsBody.reviews as ReportReview[]) : [];
+    const reportReferences = Array.isArray(referencesBody?.references) ? (referencesBody.references as ReportReference[]) : [];
+    return {
+      reportReviews,
+      reportReferences,
+      reportSourcesStatus: deriveReportSourcesStatus(reportReviews, companies),
+    };
+  };
 
   useEffect(() => {
     if (state.phase !== "loading" || !state.reportId) {
@@ -236,13 +289,21 @@ export default function App() {
         throw new Error("Could not load completed report.");
       }
       const report = await reportRes.json();
+      const companies = Object.keys(report.data || {});
+      const evidence = await fetchReportEvidence(state.reportId!, companies);
       setState((prev) => ({
         ...prev,
         phase: "report",
         reportStatus: report.status as ReportStatus,
-        companies: Object.keys(report.data || {}),
+        companies,
         data: report.data || {},
         market: report.market || null,
+        reportReviews: evidence.reportReviews,
+        reportReferences: evidence.reportReferences,
+        reportSourcesStatus: evidence.reportSourcesStatus,
+        isLoadingSources: false,
+        briefMarkdown: report.brief_markdown || "",
+        reportBlocks: Array.isArray(report.blocks) ? (report.blocks as ReportBlock[]) : [],
         chatHistory: [
           {
             id: `sys-${Date.now()}`,
@@ -309,6 +370,12 @@ export default function App() {
       reportId: null,
       reportStatus: undefined,
       market: null,
+      reportReviews: [],
+      reportReferences: [],
+      reportSourcesStatus: null,
+      isLoadingSources: false,
+      briefMarkdown: "",
+      reportBlocks: [],
     });
     setSearchInput("");
     setChatInput("");
@@ -526,6 +593,12 @@ export default function App() {
       phase: "loading",
       reportId: null,
       reportStatus: "pending",
+      reportReviews: [],
+      reportReferences: [],
+      reportSourcesStatus: null,
+      isLoadingSources: true,
+      briefMarkdown: "",
+      reportBlocks: [],
     }));
     setLoadingMessage("Starting analysis...");
 
@@ -666,198 +739,289 @@ export default function App() {
     });
   };
 
-  // Submit chatbot instruction with dynamic intent classifier
-  const executeChatCommand = async (userMsg: string) => {
-    if (!userMsg.trim() || isClassifying) return;
+  const looksLikeMutationCommand = (message: string) => {
+    const normalized = message.toLowerCase();
+    return [
+      "add ",
+      "remove ",
+      "hide ",
+      "show ",
+      "compare",
+      "chart",
+      "block",
+      "filter",
+      "toggle",
+      "include ",
+    ].some((phrase) => normalized.includes(phrase));
+  };
 
-    // Create current state text snippet to provide LLM with context
+  const runGroundedChat = async (userMsg: string) => {
+    if (!state.reportId) {
+      throw new Error("No active report to answer from.");
+    }
+
+    const response = await fetch(`/api/reports/${state.reportId}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: userMsg,
+        companies: state.companies,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error("Grounded chat could not answer from report evidence.");
+    }
+
+    const result = await response.json();
+    setState((prev) => ({
+      ...prev,
+      chatHistory: [
+        ...prev.chatHistory,
+        {
+          id: `agent-grounded-${Date.now()}`,
+          role: "agent",
+          text: result.answer || "I could not find enough evidence in the current report to answer confidently.",
+          timestamp: Date.now(),
+          citations: Array.isArray(result.citations) ? result.citations : [],
+        },
+      ],
+    }));
+  };
+
+  const runMutationChat = async (userMsg: string) => {
     let summaryText = "";
     Object.keys(state.data).forEach((c) => {
       const info = state.data[c];
-      summaryText += `${c} rating ${info.rating}, total reviews: ${info.reviewCount}. Topics: ${JSON.stringify(info.topicCounts)}. Top insights: ${info.insights.map(i => i.text).join("; ")}.\n`;
+      summaryText += `${c} rating ${info.rating}, total reviews: ${info.reviewCount}. Topics: ${JSON.stringify(info.topicCounts)}. Top insights: ${info.insights.map((i) => i.text).join("; ")}.\n`;
     });
+
+    const response = await fetch("/api/classify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: userMsg,
+        companies: state.companies,
+        filters: state.filters,
+        summaryText,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error("Chat service had an issue processing.");
+    }
+
+    const { actions, updatedData, updatedReports } = await response.json();
+
+    const generatedCustomBlocks: CustomBlock[] = [];
+    for (const act of actions) {
+      if (act.type === "ADD_CUSTOM_BLOCK" && act.payload?.custom_block_title) {
+        try {
+          const title = act.payload.custom_block_title;
+          const promptStr = act.payload.custom_block_prompt || `Analyze ${title}`;
+          const addedCompany = actions.find((a: any) => a.type === "ADD_COMPANY")?.payload?.company_name;
+          const targetCompanies = Array.from(new Set([...state.companies, addedCompany].filter(Boolean))) as string[];
+
+          const customRes = await fetch("/api/generate_custom_block", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              title,
+              prompt: promptStr,
+              companies: targetCompanies.length > 0 ? targetCompanies : state.companies,
+            }),
+          });
+
+          if (customRes.ok) {
+            const blockRes = await customRes.json();
+            generatedCustomBlocks.push({
+              id: `custom-${Date.now()}-${Math.random()}`,
+              title: blockRes.title || title,
+              data: blockRes.data,
+            });
+          }
+        } catch (e) {
+          console.error("Failed custom block pre-fetch:", e);
+        }
+      }
+    }
+
+    const companiesNeedingEvidence = new Set<string>();
+    setState((prev) => {
+      let newCompanies = [...prev.companies];
+      let newActiveBlocks = [...prev.activeBlocks];
+      let newFilters = { ...prev.filters };
+      let newData = { ...prev.data, ...updatedData };
+      let newChatHistory = [...prev.chatHistory];
+      let newCustomBlocks = [...(prev.customBlocks || [])];
+
+      if (generatedCustomBlocks.length > 0) {
+        newCustomBlocks = [...newCustomBlocks, ...generatedCustomBlocks];
+      }
+
+      actions.forEach((act: any) => {
+        switch (act.type) {
+          case "ASK":
+            if (act.payload?.answer) {
+              newChatHistory.push({
+                id: `agent-ask-${Date.now()}-${Math.random()}`,
+                role: "agent",
+                text: act.payload.answer,
+                timestamp: Date.now(),
+                citations: act.payload.citations,
+              });
+            }
+            break;
+          case "ADD_CUSTOM_BLOCK":
+            if (act.payload?.custom_block_title) {
+              newChatHistory.push({
+                id: `agent-custom-${Date.now()}`,
+                role: "agent",
+                text: `I've synthesized and custom-pinned a new KPI card: **"${act.payload.custom_block_title}"** directly onto your dashboard, customized with comparative benchmarks.`,
+                timestamp: Date.now(),
+              });
+            }
+            break;
+          case "ADD_BLOCK": {
+            const bId = act.payload?.block_id as BlockId;
+            if (bId && !newActiveBlocks.includes(bId)) {
+              newActiveBlocks.push(bId);
+            }
+            break;
+          }
+          case "REMOVE_BLOCK": {
+            const bId = act.payload?.block_id as BlockId;
+            if (bId) {
+              newActiveBlocks = newActiveBlocks.filter((id) => id !== bId);
+            }
+            break;
+          }
+          case "ADD_COMPANY": {
+            const cName = act.payload?.company_name;
+            if (cName && !newCompanies.includes(cName)) {
+              newCompanies.push(cName);
+              companiesNeedingEvidence.add(cName);
+              newChatHistory.push({
+                id: `agent-add-company-${Date.now()}`,
+                role: "agent",
+                text: `I have successfully analyzed brand **"${cName}"**, scraped its active app stores reviews, and added it to the comparison array.`,
+                timestamp: Date.now(),
+              });
+            }
+            break;
+          }
+          case "REMOVE_COMPANY": {
+            const cName = act.payload?.company_name;
+            if (cName) {
+              newCompanies = newCompanies.filter((name) => name !== cName);
+              delete newData[cName];
+            }
+            break;
+          }
+          case "FILTER": {
+            const key = act.payload?.filter_key;
+            const val = act.payload?.filter_value;
+            if (key === "sentiment" || key === "dateRange") {
+              newFilters[key] = val as any;
+            }
+            break;
+          }
+          default:
+            break;
+        }
+      });
+
+      const hasInteractiveMsg = actions.some((a: any) => a.type === "ASK" || a.type === "ADD_CUSTOM_BLOCK" || a.type === "ADD_COMPANY");
+      if (!hasInteractiveMsg) {
+        const actionTypes = actions.map((a: any) => a.type).join(", ");
+        newChatHistory.push({
+          id: `agent-act-${Date.now()}`,
+          role: "agent",
+          text: `I've updated the dashboard canvas based on your request (Actions: **${actionTypes || "None"}**).`,
+          timestamp: Date.now(),
+        });
+      }
+
+      const nextReportReviews = prev.reportReviews?.filter((review) => newCompanies.includes(review.app)) || [];
+      const nextReportReferences = prev.reportReferences?.filter((reference) => newCompanies.includes(reference.app)) || [];
+
+      return {
+        ...prev,
+        companies: newCompanies,
+        activeBlocks: newActiveBlocks,
+        filters: newFilters,
+        data: newData,
+        chatHistory: newChatHistory,
+        customBlocks: newCustomBlocks,
+        reportReviews: nextReportReviews,
+        reportReferences: nextReportReferences,
+        reportSourcesStatus: deriveReportSourcesStatus(nextReportReviews, newCompanies),
+      };
+    });
+
+    if (companiesNeedingEvidence.size > 0) {
+      const addedCompanies = Array.from(companiesNeedingEvidence);
+      const evidenceSets = await Promise.all(
+        addedCompanies.map(async (company) => {
+          const reportId = updatedReports?.[company] || state.reportId;
+          if (!reportId) {
+            return { company, reportReviews: [], reportReferences: [] };
+          }
+          const evidence = await fetchReportEvidence(reportId, [company]);
+          return { company, ...evidence };
+        })
+      );
+
+      setState((prev) => {
+        const mergedReviews = [...(prev.reportReviews || [])];
+        const mergedReferences = [...(prev.reportReferences || [])];
+
+        evidenceSets.forEach((evidence) => {
+          evidence.reportReviews.forEach((review) => {
+            if (!mergedReviews.some((item) => item.id === review.id)) {
+              mergedReviews.push(review);
+            }
+          });
+          evidence.reportReferences.forEach((reference) => {
+            if (!mergedReferences.some((item) => item.id === reference.id)) {
+              mergedReferences.push(reference);
+            }
+          });
+        });
+
+        return {
+          ...prev,
+          reportReviews: mergedReviews,
+          reportReferences: mergedReferences,
+          reportSourcesStatus: deriveReportSourcesStatus(mergedReviews, prev.companies),
+        };
+      });
+    }
+  };
+
+  const executeChatCommand = async (userMsg: string) => {
+    if (!userMsg.trim() || isClassifying) return;
 
     const userMessageObj: ChatMessage = {
       id: `user-${Date.now()}`,
       role: "user",
       text: userMsg,
-      timestamp: Date.now()
+      timestamp: Date.now(),
     };
 
     setState((prev) => ({
       ...prev,
-      chatHistory: [...prev.chatHistory, userMessageObj]
+      chatHistory: [...prev.chatHistory, userMessageObj],
     }));
 
     setIsClassifying(true);
 
     try {
-      const response = await fetch("/api/classify", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: userMsg,
-          companies: state.companies,
-          filters: state.filters,
-          summaryText
-        })
-      });
-
-      if (!response.ok) {
-        throw new Error("Chat service had an issue processing.");
+      if (state.phase === "report" && state.reportId && !looksLikeMutationCommand(userMsg)) {
+        await runGroundedChat(userMsg);
+      } else {
+        await runMutationChat(userMsg);
       }
-
-      const { actions, updatedData } = await response.json();
-
-      // Check for ADD_CUSTOM_BLOCK and pre-fetch dynamically generated custom dashboards
-      const generatedCustomBlocks: CustomBlock[] = [];
-      for (const act of actions) {
-        if (act.type === "ADD_CUSTOM_BLOCK" && act.payload?.custom_block_title) {
-          try {
-            const title = act.payload.custom_block_title;
-            const promptStr = act.payload.custom_block_prompt || `Analyze ${title}`;
-            const addedCompany = actions.find((a: any) => a.type === "ADD_COMPANY")?.payload?.company_name;
-            const targetCompanies = Array.from(new Set([...state.companies, addedCompany].filter(Boolean))) as string[];
-
-            const customRes = await fetch("/api/generate_custom_block", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                title,
-                prompt: promptStr,
-                companies: targetCompanies.length > 0 ? targetCompanies : state.companies
-              })
-            });
-
-            if (customRes.ok) {
-              const blockRes = await customRes.json();
-              generatedCustomBlocks.push({
-                id: `custom-${Date.now()}-${Math.random()}`,
-                title: blockRes.title || title,
-                data: blockRes.data
-              });
-            }
-          } catch (e) {
-            console.error("Failed custom block pre-fetch:", e);
-          }
-        }
-      }
-
-      setState((prev) => {
-        let newCompanies = [...prev.companies];
-        let newActiveBlocks = [...prev.activeBlocks];
-        let newFilters = { ...prev.filters };
-        let newData = { ...prev.data, ...updatedData };
-        let newChatHistory = [...prev.chatHistory];
-        let newCustomBlocks = [...(prev.customBlocks || [])];
-
-        // Append any generated custom blocks
-        if (generatedCustomBlocks.length > 0) {
-          newCustomBlocks = [...newCustomBlocks, ...generatedCustomBlocks];
-        }
-
-        actions.forEach((act: any) => {
-          switch (act.type) {
-            case "ASK":
-              if (act.payload?.answer) {
-                newChatHistory.push({
-                  id: `agent-ask-${Date.now()}-${Math.random()}`,
-                  role: "agent",
-                  text: act.payload.answer,
-                  timestamp: Date.now(),
-                  citations: act.payload.citations
-                });
-              }
-              break;
-
-            case "ADD_CUSTOM_BLOCK":
-              if (act.payload?.custom_block_title) {
-                newChatHistory.push({
-                  id: `agent-custom-${Date.now()}`,
-                  role: "agent",
-                  text: `I've synthesized and custom-pinned a new KPI card: **"${act.payload.custom_block_title}"** directly onto your dashboard, customized with comparative benchmarks.`,
-                  timestamp: Date.now()
-                });
-              }
-              break;
-
-            case "ADD_BLOCK": {
-              const bId = act.payload?.block_id as BlockId;
-              if (bId && !newActiveBlocks.includes(bId)) {
-                newActiveBlocks.push(bId);
-              }
-              break;
-            }
-
-            case "REMOVE_BLOCK": {
-              const bId = act.payload?.block_id as BlockId;
-              if (bId) {
-                newActiveBlocks = newActiveBlocks.filter((id) => id !== bId);
-              }
-              break;
-            }
-
-            case "ADD_COMPANY": {
-              const cName = act.payload?.company_name;
-              if (cName && !newCompanies.includes(cName)) {
-                newCompanies.push(cName);
-                newChatHistory.push({
-                  id: `agent-add-company-${Date.now()}`,
-                  role: "agent",
-                  text: `I have successfully analyzed brand **"${cName}"**, scraped its active app stores reviews, and added it to the comparison array.`,
-                  timestamp: Date.now()
-                });
-              }
-              break;
-            }
-
-            case "REMOVE_COMPANY": {
-              const cName = act.payload?.company_name;
-              if (cName) {
-                newCompanies = newCompanies.filter((name) => name !== cName);
-                delete newData[cName];
-              }
-              break;
-            }
-
-            case "FILTER": {
-              const key = act.payload?.filter_key;
-              const val = act.payload?.filter_value;
-              if (key === "sentiment" || key === "dateRange") {
-                newFilters[key] = val as any;
-              }
-              break;
-            }
-
-            default:
-              break;
-          }
-        });
-
-        // If we processed actions with blocks or company additions/removals but didn't output an ASK or ADD_CUSTOM_BLOCK or ADD_COMPANY,
-        // let's put a helpful confirmation message so the chatbot is responsive!
-        const hasInteractiveMsg = actions.some((a: any) => a.type === "ASK" || a.type === "ADD_CUSTOM_BLOCK" || a.type === "ADD_COMPANY");
-        if (!hasInteractiveMsg) {
-          const actionTypes = actions.map((a: any) => a.type).join(", ");
-          newChatHistory.push({
-            id: `agent-act-${Date.now()}`,
-            role: "agent",
-            text: `I've updated the dashboard canvas based on your request (Actions: **${actionTypes || "None"}**).`,
-            timestamp: Date.now()
-          });
-        }
-
-        return {
-          ...prev,
-          companies: newCompanies,
-          activeBlocks: newActiveBlocks,
-          filters: newFilters,
-          data: newData,
-          chatHistory: newChatHistory,
-          customBlocks: newCustomBlocks
-        };
-      });
-
     } catch (err: any) {
       console.error(err);
       setState((prev) => ({
@@ -868,9 +1032,9 @@ export default function App() {
             id: `err-${Date.now()}`,
             role: "agent",
             text: "Sorry, I had an issue analyzing that instruction. Feel free to refine or ask me something else!",
-            timestamp: Date.now()
-          }
-        ]
+            timestamp: Date.now(),
+          },
+        ],
       }));
     } finally {
       setIsClassifying(false);
@@ -1393,7 +1557,8 @@ export default function App() {
                 chatInput={chatInput}
                 setChatInput={setChatInput}
                 handleChatSubmit={handleChatSubmit}
-                getCrawlLogsForCompanies={getCrawlLogsForCompanies}
+                reportReviews={state.reportReviews || []}
+                reportSourcesStatus={state.reportSourcesStatus || null}
               />
 
               {/* Hidden old left canvas block */}
@@ -2280,15 +2445,17 @@ export default function App() {
             <div className="p-4 bg-slate-50 border-b border-gray-150 grid grid-cols-3 gap-4 text-center">
               <div>
                 <span className="block text-[10px] uppercase font-bold text-gray-450 tracking-wider">Scraped Depth</span>
-                <span className="text-sm font-bold text-slate-800">250+ Reviews</span>
+                <span className="text-sm font-bold text-slate-800">{(state.reportSourcesStatus?.totalReviews || 0).toLocaleString()} Reviews</span>
               </div>
               <div>
                 <span className="block text-[10px] uppercase font-bold text-gray-450 tracking-wider">Crawl Date</span>
-                <span className="text-sm font-bold text-[#0b57d0]">Live (30d window)</span>
+                <span className="text-sm font-bold text-[#0b57d0]">
+                  {state.reportSourcesStatus?.latestPublishedAt ? formatPublishedDate(state.reportSourcesStatus.latestPublishedAt) : "Unknown"}
+                </span>
               </div>
               <div>
                 <span className="block text-[10px] uppercase font-bold text-gray-450 tracking-wider">Source Pools</span>
-                <span className="text-sm font-bold text-emerald-600">Play/App Store Feed</span>
+                <span className="text-sm font-bold text-emerald-600">{state.reportSourcesStatus?.sources?.join(", ") || "No sources"}</span>
               </div>
             </div>
 
@@ -2299,42 +2466,97 @@ export default function App() {
                   Live Reviews Scrape Log:
                 </h4>
                 <p className="text-[11px] text-slate-500 leading-relaxed">
-                  Below are the raw anonymized reviewer sample logs processed through the Gemini Synthesis Pipeline for your active compared products:
+                  Below are the real report-scoped review rows and references used to generate this brief and answer grounded chat questions:
                 </p>
               </div>
 
               <div className="space-y-3">
-                {getCrawlLogsForCompanies().map((log, idx) => (
-                  <div key={idx} className="p-3.5 bg-gray-50 border border-gray-200 rounded-xl space-y-2 hover:border-[#0b57d0]/25 transition-all">
+                {(state.reportReviews || []).map((log, idx) => (
+                  <div key={log.id || idx} className="p-3.5 bg-gray-50 border border-gray-200 rounded-xl space-y-2 hover:border-[#0b57d0]/25 transition-all">
                     <div className="flex items-center justify-between text-xs sm:text-xs">
                       <div className="flex items-center gap-1.5 font-sans">
                         <span className="font-bold text-slate-800 capitalize bg-slate-200 px-2.1 py-0.5 rounded-md text-[10px]">
-                          {log.company}
+                          {log.app}
                         </span>
                         <span className="text-slate-400">•</span>
                         <span className="font-medium text-blue-600 font-mono text-[10px]">
-                          {log.source}
+                          {formatReportSource(log.source)}
                         </span>
+                        {log.topic && (
+                          <>
+                            <span className="text-slate-400">•</span>
+                            <span className="font-medium text-slate-500 text-[10px]">{log.topic}</span>
+                          </>
+                        )}
                       </div>
                       <span className="text-[10px] text-gray-450 font-medium">
-                        {log.date}
+                        {formatPublishedDate(log.published_at)}
                       </span>
                     </div>
                     <p className="text-xs text-slate-600 italic font-medium leading-relaxed">
-                      "{log.text}"
+                      "{log.content}"
                     </p>
-                    <div className="flex items-center gap-0.5">
+                    <div className="flex items-center gap-0.5 justify-between">
+                      <div className="flex items-center gap-0.5">
                       {Array.from({ length: 5 }).map((_, sIdx) => (
                         <span
                           key={sIdx}
-                          className={`text-xs ${sIdx < log.stars ? "text-amber-500" : "text-gray-300"}`}
+                          className={`text-xs ${typeof log.rating === "number" && sIdx < log.rating ? "text-amber-500" : "text-gray-300"}`}
                         >
                           ★
                         </span>
                       ))}
+                      </div>
+                      {log.source_url && (
+                        <a href={log.source_url} target="_blank" rel="noreferrer" className="text-[10px] font-semibold text-blue-600 hover:text-blue-700">
+                          Open source
+                        </a>
+                      )}
                     </div>
                   </div>
                 ))}
+                {state.reportReviews?.length === 0 && (
+                  <div className="text-xs text-slate-400 italic">No report evidence has been loaded yet.</div>
+                )}
+              </div>
+
+              <div className="space-y-1 pt-3 border-t border-gray-150">
+                <h4 className="text-xs font-bold text-slate-700 uppercase tracking-widest">
+                  Ranked References:
+                </h4>
+                <p className="text-[11px] text-slate-500 leading-relaxed">
+                  These are the prioritized references attached to the generated insights.
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                {(state.reportReferences || []).map((reference) => (
+                  <div key={reference.id} className="p-3.5 bg-white border border-gray-200 rounded-xl space-y-2">
+                    <div className="flex items-center justify-between text-[10px]">
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-bold text-slate-800 bg-slate-100 px-2 py-0.5 rounded-md">#{reference.rank ?? "-"}</span>
+                        <span className="font-semibold text-slate-700">{reference.app}</span>
+                        <span className="text-slate-400">•</span>
+                        <span className="font-medium text-blue-600">{formatReportSource(reference.source)}</span>
+                        {reference.topic && (
+                          <>
+                            <span className="text-slate-400">•</span>
+                            <span className="text-slate-500">{reference.topic}</span>
+                          </>
+                        )}
+                      </div>
+                      {reference.source_url && (
+                        <a href={reference.source_url} target="_blank" rel="noreferrer" className="font-semibold text-blue-600 hover:text-blue-700">
+                          Open source
+                        </a>
+                      )}
+                    </div>
+                    <p className="text-xs text-slate-600 leading-relaxed">{reference.content}</p>
+                  </div>
+                ))}
+                {state.reportReferences?.length === 0 && (
+                  <div className="text-xs text-slate-400 italic">No ranked references were persisted for this report.</div>
+                )}
               </div>
 
               <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 flex items-start gap-2.5">

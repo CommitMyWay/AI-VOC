@@ -2,6 +2,7 @@ import { clearReferencesForReport, query, updateReport, updateReportData, withTr
 import { pipelineEvents } from "../events.ts";
 import { callAgent } from "../openclaw.ts";
 import { buildMetrics } from "./aggregate.ts";
+import { buildReportPresentation } from "./brief.ts";
 import { classifyReviews } from "./classify.ts";
 import { fetchAllSources } from "./fetchAll.ts";
 import { buildMarketView } from "./marketView.ts";
@@ -143,7 +144,14 @@ export async function runReport(reportId: string, apps: string[], goal: string, 
       });
     }
 
-    const finalPayload = { data, market: await buildMarketView(reportId) };
+    const finalMarket = await buildMarketView(reportId);
+    const presentation = buildReportPresentation({
+      query: apps.join(" vs "),
+      apps,
+      data,
+      market: finalMarket,
+    });
+    const finalPayload = { data, market: finalMarket, ...presentation };
     await updateReport({
       id: reportId,
       status: "ready",
