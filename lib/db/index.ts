@@ -1,9 +1,10 @@
 import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
+import { readEnv } from "../env.ts";
 
 const defaultDbPath = path.join(process.cwd(), "aivoc.db");
-const configuredDatabaseUrl = process.env.DATABASE_URL;
+const configuredDatabaseUrl = readEnv("DATABASE_URL");
 const dbPath =
   configuredDatabaseUrl && configuredDatabaseUrl.startsWith("file:")
     ? configuredDatabaseUrl.replace(/^file:/, "")

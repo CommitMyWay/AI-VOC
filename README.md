@@ -109,6 +109,12 @@ A production deploy should:
 - provide `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL` securely through environment variables
 - run `npm run build`
 - serve the bundled app with `npm run start`
+- avoid mounting local SQLite or secret files into the image build context
+
+Notes:
+
+- The container defaults `DATABASE_URL` to `file:/tmp/aivoc.db` so SQLite uses a writable runtime path.
+- The server strips wrapping quotes from env vars like `"https://..."` to stay resilient to injected `.env` formatting.
 
 The current server listens on `PORT` and defaults to `8080`, with `GET /health` available for runtime health checks.
 

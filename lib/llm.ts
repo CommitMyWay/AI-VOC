@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { readEnv, readEnvOr } from "./env.ts";
 
 const DEFAULT_LLM_BASE_URL = "https://maas-llm-aiplatform-hcm.api.vngcloud.vn/v1";
 const DEFAULT_LLM_MODEL = "gpt-4.1-mini";
@@ -9,9 +10,9 @@ export type ChatMessage = {
 };
 
 export function getLlmConfig() {
-  const apiKey = process.env.OPENAI_API_KEY || process.env.LLM_API_KEY;
-  const baseUrl = (process.env.OPENAI_BASE_URL || process.env.LLM_BASE_URL || DEFAULT_LLM_BASE_URL).replace(/\/+$/, "");
-  const model = process.env.OPENAI_MODEL || process.env.LLM_MODEL || DEFAULT_LLM_MODEL;
+  const apiKey = readEnv("OPENAI_API_KEY") || readEnv("LLM_API_KEY");
+  const baseUrl = readEnvOr("OPENAI_BASE_URL", readEnvOr("LLM_BASE_URL", DEFAULT_LLM_BASE_URL)).replace(/\/+$/, "");
+  const model = readEnv("OPENAI_MODEL") || readEnv("LLM_MODEL") || DEFAULT_LLM_MODEL;
 
   if (!apiKey) {
     throw new Error("Missing OPENAI_API_KEY (or LLM_API_KEY).");

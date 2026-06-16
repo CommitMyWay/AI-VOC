@@ -1,9 +1,10 @@
 import { createOpenAIClient, getLlmConfig } from "../llm.ts";
+import { readEnv } from "../env.ts";
 import type { Classification, RawReview, ReviewSentiment } from "./types.ts";
 import { clamp, normalizeWhitespace } from "./util.ts";
 
 const DEFAULT_TOPIC = "General";
-const CLASSIFY_MODEL = process.env.CLASSIFY_MODEL || process.env.OPENAI_MODEL || process.env.LLM_MODEL || "gpt-4.1-mini";
+const CLASSIFY_MODEL = readEnv("CLASSIFY_MODEL") || readEnv("OPENAI_MODEL") || readEnv("LLM_MODEL") || "gpt-4.1-mini";
 const TOPIC_KEYWORDS: Record<string, string[]> = {
   Login: ["login", "otp", "password", "signin", "sign in", "đăng nhập"],
   Payment: ["payment", "pay", "transfer", "transaction", "refund", "cash", "bank"],

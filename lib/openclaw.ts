@@ -1,4 +1,5 @@
 import { callJsonCompletion } from "./llm.ts";
+import { readEnv } from "./env.ts";
 import type { CompanyData, MarketView } from "./crawler/types.ts";
 
 type InsightResponse = {
@@ -74,8 +75,8 @@ export async function callAgent(payload: {
   evidence: Array<{ source: string; content: string; rating: number | null }>;
   market?: MarketView | null;
 }): Promise<InsightResponse> {
-  const openclawUrl = process.env.OPENCLAW_URL;
-  const openclawToken = process.env.OPENCLAW_TOKEN;
+  const openclawUrl = readEnv("OPENCLAW_URL");
+  const openclawToken = readEnv("OPENCLAW_TOKEN");
 
   if (openclawUrl) {
     try {
